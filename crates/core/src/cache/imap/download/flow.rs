@@ -35,6 +35,9 @@ use crate::{
         imap::executor::{
             compress_uid_list, generate_uid_sequence_hashset, ImapExecutor, DEFAULT_BATCH_SIZE,
         },
+        imap::manager::{AcquisitionConnection, ImapConnectionManager},
+        imap::uidonly_acquisition::{acquire_bichon_mailbox, AcquisitionLimits},
+        settings::dir::DATA_DIR_MANAGER,
         store::tantivy::envelope::ENVELOPE_MANAGER,
     },
 };
@@ -262,8 +265,56 @@ pub async fn fetch_and_save_full_mailbox(
     let mailbox_id = mailbox.id;
     let account_id = account.id;
 
-    let mut session = match ImapExecutor::create_connection(account_id).await {
-        Ok(session) => session,
+    let limits = AcquisitionLimits::for_account(account);
+    let connection = ImapConnectionManager::build_acquisition(
+        account_id,
+        limits.response_limits()?,
+    )
+    .await;
+    let mut session = match connection {
+        Ok(AcquisitionConnection::Standard(session)) => session,
+        Ok(AcquisitionConnection::UidOnly {
+            session,
+            message_limit,
+        }) => {
+            let root = DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition");
+            let report = acquire_bichon_mailbox(
+                account,
+                mailbox,
+                session,
+                message_limit,
+                &root,
+                limits,
+                token,
+            )
+            .await?;
+            DownloadState::update_folder_progress(
+                account_id,
+                mailbox.name.clone(),
+                report.planned,
+                report.processed,
+                if report.success {
+                    FolderStatus::Success
+                } else {
+                    FolderStatus::Failed
+                },
+                (!report.success).then(|| {
+                    "UIDONLY snapshot contains unresolved UIDs; checkpoint was not advanced"
+                        .to_string()
+                }),
+            )?;
+            if !report.success {
+                return Err(raise_error!(
+                    "UIDONLY snapshot incomplete; see durable per-UID ledger".into(),
+                    ErrorCode::ImapUnexpectedResult
+                ));
+            }
+            let mut updated = mailbox.clone();
+            updated.uid_validity = Some(report.uid_validity);
+            updated.highest_uid = report.checkpoint;
+            MailBox::batch_upsert(&[updated])?;
+            return Ok(report.checkpoint);
+        }
         Err(e) => {
             let err_msg = format!("Connection failed for this folder: {:#?}", e);
             DownloadState::update_folder_progress(

@@ -38,7 +38,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -47,6 +47,7 @@ type Response = Vec<u8>;
 pub struct MockImapServer {
     greeting: Vec<u8>,
     script: Vec<(String, Response)>,
+    transcript: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockImapServer {
@@ -54,6 +55,7 @@ impl MockImapServer {
         Self {
             greeting: b"* OK Mock IMAP server ready\r\n".to_vec(),
             script: Vec::new(),
+            transcript: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -76,6 +78,7 @@ impl MockImapServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
 
+        let transcript = self.transcript.clone();
         let server = Arc::new(self);
 
         tokio::spawn(async move {
@@ -92,7 +95,7 @@ impl MockImapServer {
             }
         });
 
-        MockImapServerHandle { addr }
+        MockImapServerHandle { addr, transcript }
     }
 
     async fn handle_connection(&self, mut stream: TcpStream) {
@@ -112,6 +115,11 @@ impl MockImapServer {
                 Ok(_) => {}
                 Err(_) => break,
             }
+
+            self.transcript
+                .lock()
+                .expect("transcript lock")
+                .push(line.trim_end().to_string());
 
             let tag = extract_tag(&line).unwrap_or("A0");
             let matched = self.find_match(&line);
@@ -151,6 +159,7 @@ impl Default for MockImapServer {
 /// is dropped.
 pub struct MockImapServerHandle {
     addr: SocketAddr,
+    transcript: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockImapServerHandle {
@@ -160,6 +169,10 @@ impl MockImapServerHandle {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    pub fn commands(&self) -> Vec<String> {
+        self.transcript.lock().expect("transcript lock").clone()
     }
 }
 

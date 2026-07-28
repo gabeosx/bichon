@@ -54,7 +54,7 @@ use tantivy::{
         agg_result::{AggregationResult, BucketResult},
         AggregationCollector, Key,
     },
-    collector::{Count, FacetCollector, TopDocs},
+    collector::{Count, DocSetCollector, FacetCollector, TopDocs},
     indexer::{LogMergePolicy, UserOperation},
     query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, QueryParser, RangeQuery, TermQuery},
     schema::{Field, IndexRecordOption, Value},
@@ -75,6 +75,14 @@ pub struct IndexManager {
     sender: mpsc::Sender<TantivyDocument>,
     reader: IndexReader,
     handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CanonicalAttachmentRecord {
+    pub content_hash: String,
+    pub name: Option<String>,
+    pub size: u64,
+    pub content_type: String,
 }
 
 impl IndexManager {
@@ -207,6 +215,136 @@ impl IndexManager {
 
     pub async fn queue(&self, doc: TantivyDocument) {
         let _ = self.sender.send(doc).await;
+    }
+
+    /// Commits the attachment documents before returning so an acquisition
+    /// checkpoint cannot outrun the canonical attachment index.
+    pub(crate) async fn commit_documents(&self, docs: Vec<TantivyDocument>) -> BichonResult<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.index_writer.lock().await;
+        for doc in docs {
+            writer
+                .add_document(doc)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        }
+        writer
+            .commit()
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        Ok(())
+    }
+
+    pub(crate) async fn rollback_documents(
+        &self,
+        account_id: u64,
+        envelope_id: &str,
+    ) -> BichonResult<HashSet<String>> {
+        let query = self.attachment_query(account_id, envelope_id);
+        let searcher = self.create_searcher()?;
+        let fields = SchemaTools::attachment_fields();
+        let mut content_hashes = HashSet::new();
+        for address in searcher
+            .search(query.as_ref(), &DocSetCollector)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+        {
+            let doc = searcher
+                .doc::<TantivyDocument>(address)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+            if let Some(hash) = doc
+                .get_first(fields.f_content_hash)
+                .and_then(|value| value.as_str())
+            {
+                content_hashes.insert(hash.to_string());
+            }
+        }
+
+        let mut writer = self.index_writer.lock().await;
+        writer
+            .delete_query(self.attachment_query(account_id, envelope_id))
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        writer
+            .commit()
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        Ok(content_hashes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_by_envelope(
+        &self,
+        account_id: u64,
+        envelope_id: &str,
+    ) -> BichonResult<u64> {
+        let searcher = self.create_searcher()?;
+        searcher
+            .search(
+                self.attachment_query(account_id, envelope_id).as_ref(),
+                &Count,
+            )
+            .map(|count| count as u64)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))
+    }
+
+    pub(crate) fn canonical_records_by_envelope(
+        &self,
+        account_id: u64,
+        envelope_id: &str,
+    ) -> BichonResult<Vec<CanonicalAttachmentRecord>> {
+        let searcher = self.create_searcher()?;
+        let fields = SchemaTools::attachment_fields();
+        let addresses = searcher
+            .search(
+                self.attachment_query(account_id, envelope_id).as_ref(),
+                &DocSetCollector,
+            )
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        let mut records = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let doc = searcher
+                .doc::<TantivyDocument>(address)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+            let content_hash = doc
+                .get_first(fields.f_content_hash)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical attachment has no content hash".into(),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .to_string();
+            let size = doc
+                .get_first(fields.f_size)
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical attachment has no size".into(),
+                        ErrorCode::InternalError
+                    )
+                })?;
+            let content_type = doc
+                .get_first(fields.f_content_type)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical attachment has no content type".into(),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .to_string();
+            let name = doc
+                .get_first(fields.f_name_exact)
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned);
+            records.push(CanonicalAttachmentRecord {
+                content_hash,
+                name,
+                size,
+                content_type,
+            });
+        }
+        records.sort();
+        Ok(records)
     }
 
     fn open_or_create_index(index_dir: &PathBuf) -> Index {

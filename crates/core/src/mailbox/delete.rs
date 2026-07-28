@@ -19,8 +19,11 @@
 use crate::{
     cache::imap::mailbox::MailBox,
     error::BichonResult,
+    imap::uidonly_acquisition::cleanup_uidonly_mailbox_state,
+    settings::dir::DATA_DIR_MANAGER,
     store::tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
 };
+use std::collections::BTreeSet;
 
 pub async fn delete_mailbox_impl(account_id: u64, mailbox_id: u64) -> BichonResult<()> {
     let mailbox = MailBox::get(mailbox_id)?;
@@ -30,15 +33,25 @@ pub async fn delete_mailbox_impl(account_id: u64, mailbox_id: u64) -> BichonResu
     let all_mailboxes = MailBox::list_all(account_id)?;
 
     let prefix = format!("{}{}", name, delimiter);
-    let ids_to_delete: Vec<u64> = all_mailboxes
+    let mailboxes_to_delete: Vec<_> = all_mailboxes
         .into_iter()
         .filter(|m| m.id == mailbox_id || m.name.starts_with(&prefix))
-        .map(|m| m.id)
         .collect();
+    let ids_to_delete: Vec<u64> = mailboxes_to_delete.iter().map(|mailbox| mailbox.id).collect();
 
     if ids_to_delete.is_empty() {
         return Ok(());
     }
+
+    let names_to_delete: BTreeSet<String> = mailboxes_to_delete
+        .iter()
+        .map(|mailbox| mailbox.name.clone())
+        .collect();
+    cleanup_uidonly_mailbox_state(
+        &DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition"),
+        account_id,
+        &names_to_delete,
+    )?;
 
     for id in &ids_to_delete {
         MailBox::delete(*id)?;

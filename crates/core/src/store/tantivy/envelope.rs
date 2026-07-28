@@ -30,6 +30,7 @@ use crate::{
     dashboard::{DashboardStats, Group, LargestEmail, TimeBucket},
     error::{code::ErrorCode, BichonResult},
     message::{
+        content::AttachmentInfo,
         search::{EmailSearchFilter, SortBy},
         tags::{TagAction, TagCount, TagsRequest},
     },
@@ -87,6 +88,14 @@ pub struct IndexManager {
     sender: mpsc::Sender<TantivyDocument>,
     reader: IndexReader,
     handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalProjectionRecord {
+    pub envelope_id: String,
+    pub content_hash: String,
+    pub shard_id: u64,
+    pub attachments: Vec<AttachmentInfo>,
 }
 
 impl IndexManager {
@@ -227,6 +236,134 @@ impl IndexManager {
         if let Err(e) = self.sender.send(doc).await {
             tracing::warn!(error = %e, "Failed to queue document into Tantivy writer channel");
         }
+    }
+
+    /// Adds and commits a document before returning. The UIDONLY acquisition
+    /// path uses this as its canonical projection barrier before advancing a
+    /// durable checkpoint.
+    pub(crate) async fn commit_document(&self, doc: TantivyDocument) -> BichonResult<()> {
+        let mut writer = self.index_writer.lock().await;
+        writer
+            .add_document(doc)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        writer
+            .commit()
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        Ok(())
+    }
+
+    pub(crate) fn get_projection_by_uid(
+        &self,
+        account_id: u64,
+        mailbox_id: u64,
+        uid: u32,
+    ) -> BichonResult<Option<CanonicalProjectionRecord>> {
+        let fields = SchemaTools::email_fields();
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(fields.f_account_id, account_id),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(fields.f_mailbox_id, mailbox_id),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(fields.f_uid, uid as u64),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        let searcher = self.create_searcher()?;
+        let docs = searcher
+            .search(&query, &TopDocs::with_limit(2).order_by_score())
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        if docs.len() > 1 {
+            return Err(raise_error!(
+                format!(
+                    "multiple canonical records exist for account {account_id}, mailbox {mailbox_id}, UID {uid}"
+                ),
+                ErrorCode::Incompatible
+            ));
+        }
+        let Some((_, address)) = docs.first() else {
+            return Ok(None);
+        };
+        let doc = searcher
+            .doc::<TantivyDocument>(*address)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        Ok(Some(CanonicalProjectionRecord {
+            envelope_id: doc
+                .get_first(fields.f_id)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no envelope id".into(),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .to_string(),
+            content_hash: doc
+                .get_first(fields.f_content_hash)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no content hash".into(),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .to_string(),
+            shard_id: doc
+                .get_first(fields.f_shard_id)
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no shard id".into(),
+                        ErrorCode::InternalError
+                    )
+                })?,
+            attachments: doc
+                .get_first(fields.f_attachments)
+                .and_then(|value| value.as_str())
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| {
+                    raise_error!(
+                        format!("canonical UID record has invalid attachment metadata: {e}"),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .unwrap_or_default(),
+        }))
+    }
+
+    pub(crate) async fn rollback_uidonly_projection(
+        &self,
+        account_id: u64,
+        envelope_id: &str,
+        email_content_hash: String,
+        attachment_content_hashes: HashSet<String>,
+    ) -> BichonResult<()> {
+        let mut writer = self.index_writer.lock().await;
+        writer
+            .delete_query(self.envelope_query(account_id, envelope_id))
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        writer
+            .commit()
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        self.cleanup_unused_content(
+            &mut writer,
+            HashSet::from([email_content_hash]),
+            attachment_content_hashes,
+        )
     }
 
     fn open_or_create_index(index_dir: &PathBuf) -> Index {

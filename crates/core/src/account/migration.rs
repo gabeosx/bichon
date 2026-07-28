@@ -39,6 +39,7 @@ use crate::{
     id,
     oauth2::token::OAuth2AccessToken,
     raise_error,
+    settings::dir::DATA_DIR_MANAGER,
     store::tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
     users::{payload::UserUpdateRequest, role::DEFAULT_ACCOUNT_MANAGER_ROLE_ID, UserModel},
     utc_now,
@@ -498,6 +499,10 @@ impl Account {
         }
         OAuth2AccessToken::try_delete(account.id)?;
         UserModel::cleanup_account(account.id)?;
+        crate::imap::uidonly_acquisition::cleanup_uidonly_account_state(
+            &DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition"),
+            account.id,
+        )?;
         MailBox::clean(account.id)?;
         ENVELOPE_MANAGER
             .delete_account_envelopes(account.id)

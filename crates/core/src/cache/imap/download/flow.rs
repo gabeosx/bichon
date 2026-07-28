@@ -35,6 +35,9 @@ use crate::{
         imap::executor::{
             compress_uid_list, generate_uid_sequence_hashset, ImapExecutor, DEFAULT_BATCH_SIZE,
         },
+        imap::manager::{AcquisitionConnection, ImapConnectionManager},
+        imap::uidonly_acquisition::{acquire_bichon_mailbox, AcquisitionLimits},
+        settings::dir::DATA_DIR_MANAGER,
         store::tantivy::envelope::ENVELOPE_MANAGER,
     },
 };
@@ -49,6 +52,23 @@ const MAX_NETWORK_RETRIES: u32 = 3;
 pub enum FetchDirection {
     Since,
     Before,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UidValiditySyncStrategy {
+    ReconcileByMessageId,
+    Incremental,
+}
+
+fn uid_validity_sync_strategy(
+    local_uid_validity: Option<u32>,
+    remote_uid_validity: u32,
+) -> UidValiditySyncStrategy {
+    if local_uid_validity == Some(remote_uid_validity) {
+        UidValiditySyncStrategy::Incremental
+    } else {
+        UidValiditySyncStrategy::ReconcileByMessageId
+    }
 }
 
 pub async fn fetch_and_save_by_date(
@@ -262,8 +282,56 @@ pub async fn fetch_and_save_full_mailbox(
     let mailbox_id = mailbox.id;
     let account_id = account.id;
 
-    let mut session = match ImapExecutor::create_connection(account_id).await {
-        Ok(session) => session,
+    let limits = AcquisitionLimits::for_account(account);
+    let connection = ImapConnectionManager::build_acquisition(
+        account_id,
+        limits.response_limits()?,
+    )
+    .await;
+    let mut session = match connection {
+        Ok(AcquisitionConnection::Standard(session)) => session,
+        Ok(AcquisitionConnection::UidOnly {
+            session,
+            message_limit,
+        }) => {
+            let root = DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition");
+            let report = acquire_bichon_mailbox(
+                account,
+                mailbox,
+                session,
+                message_limit,
+                &root,
+                limits,
+                token,
+            )
+            .await?;
+            DownloadState::update_folder_progress(
+                account_id,
+                mailbox.name.clone(),
+                report.planned,
+                report.processed,
+                if report.success {
+                    FolderStatus::Success
+                } else {
+                    FolderStatus::Failed
+                },
+                (!report.success).then(|| {
+                    "UIDONLY snapshot contains unresolved UIDs; checkpoint was not advanced"
+                        .to_string()
+                }),
+            )?;
+            if !report.success {
+                return Err(raise_error!(
+                    "UIDONLY snapshot incomplete; see durable per-UID ledger".into(),
+                    ErrorCode::ImapUnexpectedResult
+                ));
+            }
+            let mut updated = mailbox.clone();
+            updated.uid_validity = Some(report.uid_validity);
+            updated.highest_uid = report.checkpoint;
+            MailBox::batch_upsert(&[updated])?;
+            return Ok(report.checkpoint);
+        }
         Err(e) => {
             let err_msg = format!("Connection failed for this folder: {:#?}", e);
             DownloadState::update_folder_progress(
@@ -784,23 +852,34 @@ pub async fn reconcile_mailboxes(
                 }
             };
 
-            let new_highest_uid = if local_mailbox.uid_validity != Some(remote_uid_validity) {
-                info!(
-                    "Account {}: Mailbox '{}' detected with changed uid_validity (local: {:#?}, remote: {:#?}). \
-                    Comparing by Message-ID to find missing emails.",
-                    account_id, local_mailbox.name, &local_mailbox.uid_validity, &remote_uid_validity
-                );
+            let new_highest_uid = match uid_validity_sync_strategy(
+                local_mailbox.uid_validity,
+                remote_uid_validity,
+            ) {
+                UidValiditySyncStrategy::ReconcileByMessageId => {
+                    info!(
+                        "Account {}: Mailbox '{}' detected with changed uid_validity (local: {:#?}, remote: {:#?}). \
+                        Comparing by Message-ID to find missing emails.",
+                        account_id, local_mailbox.name, &local_mailbox.uid_validity, &remote_uid_validity
+                    );
 
-                reconcile_uid_validity_change(
-                    account,
-                    local_mailbox,
-                    remote_mailbox,
-                    token.clone(),
-                )
-                .await?
-            } else {
-                perform_incremental_sync(account, local_mailbox, remote_mailbox, token.clone())
+                    reconcile_uid_validity_change(
+                        account,
+                        local_mailbox,
+                        remote_mailbox,
+                        token.clone(),
+                    )
                     .await?
+                }
+                UidValiditySyncStrategy::Incremental => {
+                    perform_incremental_sync(
+                        account,
+                        local_mailbox,
+                        remote_mailbox,
+                        token.clone(),
+                    )
+                    .await?
+                }
             };
 
             let mut updated = remote_mailbox.clone();
@@ -1041,6 +1120,22 @@ mod tests {
     fn test_generate_synthetic_uidvalidity_non_zero() {
         let uid = generate_synthetic_uidvalidity("INBOX");
         assert_ne!(uid, 0, "UIDVALIDITY should not be 0 (reserved)");
+    }
+
+    #[test]
+    fn uidvalidity_strategy_routes_changes_through_message_id_reconciliation() {
+        assert_eq!(
+            uid_validity_sync_strategy(Some(9), 10),
+            UidValiditySyncStrategy::ReconcileByMessageId
+        );
+        assert_eq!(
+            uid_validity_sync_strategy(None, 10),
+            UidValiditySyncStrategy::ReconcileByMessageId
+        );
+        assert_eq!(
+            uid_validity_sync_strategy(Some(10), 10),
+            UidValiditySyncStrategy::Incremental
+        );
     }
 
     // ============================================================

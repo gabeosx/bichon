@@ -11,7 +11,7 @@ use crate::raise_error;
 use crate::store::tantivy::attachment::ATTACHMENT_MANAGER;
 use crate::store::tantivy::envelope::ENVELOPE_MANAGER;
 use crate::store::tantivy::fields::{
-    F_ACCOUNT_ID, F_CONTENT_HASH, F_ID, F_INGEST_AT, F_MAILBOX_ID,
+    F_ACCOUNT_ID, F_CONTENT_HASH, F_ID, F_INGEST_AT, F_MAILBOX_ID, F_SHARD_ID, F_UID,
 };
 use crate::store::tantivy::schema::SchemaTools;
 
@@ -30,10 +30,21 @@ struct DedupEntry {
     email_id: String,
 }
 
+pub(crate) const UIDONLY_SHARD_ID: u64 = u64::MAX;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum DedupIdentity {
+    Legacy,
+    UidOnly(u64),
+}
+
 /// Dedup map for one account.
-/// Key   = (mailbox_id, content_hash)  — stable identity across uidvalidity resets
+/// Legacy keying remains (mailbox_id, content_hash), preserving the existing
+/// UIDVALIDITY-reset behavior. UIDONLY documents use a reserved shard marker
+/// and add UID to the identity because RFC 9586 treats distinct UIDs as
+/// distinct logical records even when their RFC822 bytes are identical.
 /// Value = all documents sharing that key, to be reduced to exactly one.
-type DedupMap = HashMap<(u64, String), Vec<DedupEntry>>;
+type DedupMap = HashMap<(u64, String, DedupIdentity), Vec<DedupEntry>>;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -178,6 +189,14 @@ fn dedup_account(
             .fast_fields()
             .i64(F_INGEST_AT)
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let uid_col = segment_reader
+            .fast_fields()
+            .u64(F_UID)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        let shard_col = segment_reader
+            .fast_fields()
+            .u64(F_SHARD_ID)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
         // content_hash and f_id are text fields with FAST; stored as dictionary-encoded strings
         let hash_col = segment_reader
             .fast_fields()
@@ -202,6 +221,11 @@ fn dedup_account(
 
             let mailbox_id = mailbox_col.values.get_val(doc_id);
             let ingest_at = ingest_col.values.get_val(doc_id);
+            let identity = if shard_col.values.get_val(doc_id) == UIDONLY_SHARD_ID {
+                DedupIdentity::UidOnly(uid_col.values.get_val(doc_id))
+            } else {
+                DedupIdentity::Legacy
+            };
 
             // Read content_hash from the dictionary-encoded string column
             let hash_ord = hash_col
@@ -231,7 +255,7 @@ fn dedup_account(
             //     "DEBUG dedup_account: account={account_id} doc_id={doc_id} mailbox={mailbox_id} hash={content_hash:?} id={email_id:?} ingest_at={ingest_at}"
             // );
 
-            map.entry((mailbox_id, content_hash))
+            map.entry((mailbox_id, content_hash, identity))
                 .or_default()
                 .push(DedupEntry {
                     ingest_at,
@@ -409,12 +433,29 @@ mod tests {
         hash: &str,
         ingest_at: i64,
     ) {
+        add_email_with_identity(f, w, id, account, mailbox, hash, ingest_at, 0, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_email_with_identity(
+        f: &EmailFields,
+        w: &mut IndexWriter,
+        id: &str,
+        account: u64,
+        mailbox: u64,
+        hash: &str,
+        ingest_at: i64,
+        uid: u64,
+        shard_id: u64,
+    ) {
         let mut doc = TantivyDocument::new();
         doc.add_text(f.f_id, id);
         doc.add_u64(f.f_account_id, account);
         doc.add_u64(f.f_mailbox_id, mailbox);
         doc.add_text(f.f_content_hash, hash);
         doc.add_i64(f.f_ingest_at, ingest_at);
+        doc.add_u64(f.f_uid, uid);
+        doc.add_u64(f.f_shard_id, shard_id);
         w.add_document(doc).unwrap();
     }
 
@@ -513,6 +554,42 @@ mod tests {
             },
             &["dup-new", "unique"],
             &["att-new"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dedup_preserves_identical_uidonly_bodies_at_distinct_uids() {
+        Harness::run(
+            "uidonly-distinct-uids",
+            |ef, ew, af, aw| {
+                add_email_with_identity(
+                    ef,
+                    ew,
+                    "uid-10",
+                    1,
+                    200,
+                    "hash-same",
+                    1000,
+                    10,
+                    UIDONLY_SHARD_ID,
+                );
+                add_email_with_identity(
+                    ef,
+                    ew,
+                    "uid-20",
+                    1,
+                    200,
+                    "hash-same",
+                    2000,
+                    20,
+                    UIDONLY_SHARD_ID,
+                );
+                add_attachment(af, aw, "att-10", "uid-10", 1, 200);
+                add_attachment(af, aw, "att-20", "uid-20", 1, 200);
+            },
+            &["uid-10", "uid-20"],
+            &["att-10", "att-20"],
         )
         .await;
     }

@@ -187,9 +187,23 @@ pub(crate) struct UidEntry {
 pub(crate) struct AcquisitionLedger {
     pub identity: AcquisitionIdentity,
     pub uid_validity: u32,
+    #[serde(default = "first_uid")]
+    pub snapshot_start: u32,
     pub snapshot_end: u32,
     pub checkpoint: Option<u32>,
+    #[serde(default)]
+    pub vanished_ranges: Vec<UidRange>,
     pub entries: BTreeMap<u32, UidEntry>,
+}
+
+const fn first_uid() -> u32 {
+    1
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct UidRange {
+    pub start: u32,
+    pub end: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +264,8 @@ pub(crate) trait UidOnlyTransport {
 
 #[allow(async_fn_in_trait)]
 trait CanonicalArchive {
+    fn begin_epoch(&mut self, uid_validity: u32) -> BichonResult<()>;
+
     fn disk_budget(&self, raw: &[u8]) -> BichonResult<u64>;
 
     async fn project(
@@ -266,12 +282,14 @@ trait CanonicalArchive {
         uid: u32,
         content_hash: &str,
         envelope_id: Option<&str>,
+        raw: Option<&[u8]>,
     ) -> BichonResult<()>;
 }
 
 struct BichonCanonicalArchive {
     account_id: u64,
     mailbox_id: u64,
+    uid_validity: Option<u32>,
 }
 
 static UIDONLY_CANONICAL_WRITE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -299,18 +317,33 @@ impl BichonCanonicalArchive {
         Self {
             account_id,
             mailbox_id,
+            uid_validity: None,
         }
     }
 
     fn envelope_id(&self, uid: u32, content_hash: &str) -> String {
-        Self::envelope_id_for(self.account_id, self.mailbox_id, uid, content_hash)
+        Self::envelope_id_for(
+            self.account_id,
+            self.mailbox_id,
+            self.uid_validity
+                .expect("UIDONLY epoch must be initialized"),
+            uid,
+            content_hash,
+        )
     }
 
-    fn envelope_id_for(account_id: u64, mailbox_id: u64, uid: u32, content_hash: &str) -> String {
+    fn envelope_id_for(
+        account_id: u64,
+        mailbox_id: u64,
+        uid_validity: u32,
+        uid: u32,
+        content_hash: &str,
+    ) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"bichon-uidonly-envelope-v1");
+        hasher.update(b"bichon-uidonly-envelope-v2");
         hasher.update(&account_id.to_be_bytes());
         hasher.update(&mailbox_id.to_be_bytes());
+        hasher.update(&uid_validity.to_be_bytes());
         hasher.update(&uid.to_be_bytes());
         hasher.update(content_hash.as_bytes());
         format!("uidonly-{}", hasher.finalize().to_hex())
@@ -347,6 +380,11 @@ impl BichonCanonicalArchive {
 }
 
 impl CanonicalArchive for BichonCanonicalArchive {
+    fn begin_epoch(&mut self, uid_validity: u32) -> BichonResult<()> {
+        self.uid_validity = Some(uid_validity);
+        Ok(())
+    }
+
     fn disk_budget(&self, raw: &[u8]) -> BichonResult<u64> {
         (raw.len() as u64)
             .checked_mul(4)
@@ -368,6 +406,12 @@ impl CanonicalArchive for BichonCanonicalArchive {
     ) -> BichonResult<CanonicalProjection> {
         let account_id = self.account_id;
         let mailbox_id = self.mailbox_id;
+        let uid_validity = self.uid_validity.ok_or_else(|| {
+            raise_error!(
+                "UIDONLY canonical epoch was not initialized".into(),
+                ErrorCode::InternalError
+            )
+        })?;
         let body = raw.to_vec();
         let task = tokio::spawn(async move {
             // The task owns the body, shutdown token, and serialization guard.
@@ -381,8 +425,10 @@ impl CanonicalArchive for BichonCanonicalArchive {
                 ));
             }
             let expected_hash = compute_content_hash(&body);
+            let envelope_id =
+                Self::envelope_id_for(account_id, mailbox_id, uid_validity, uid, &expected_hash);
             if let Some(existing) =
-                ENVELOPE_MANAGER.get_projection_by_uid(account_id, mailbox_id, uid)?
+                ENVELOPE_MANAGER.get_projection_by_envelope_id(account_id, &envelope_id)?
             {
                 return Self::reuse_projection(uid, &expected_hash, existing);
             }
@@ -392,7 +438,6 @@ impl CanonicalArchive for BichonCanonicalArchive {
                     ErrorCode::PayloadTooLarge
                 )
             })?;
-            let envelope_id = Self::envelope_id_for(account_id, mailbox_id, uid, &expected_hash);
             project_uidonly_message(
                 &body,
                 uid,
@@ -411,11 +456,14 @@ impl CanonicalArchive for BichonCanonicalArchive {
 
     async fn verify(&self, uid: u32, blob_hash: &str, envelope_id: &str) -> BichonResult<bool> {
         let Some(record) =
-            ENVELOPE_MANAGER.get_projection_by_uid(self.account_id, self.mailbox_id, uid)?
+            ENVELOPE_MANAGER.get_projection_by_envelope_id(self.account_id, envelope_id)?
         else {
             return Ok(false);
         };
-        if record.envelope_id != envelope_id || record.content_hash != blob_hash {
+        if record.envelope_id != envelope_id
+            || record.uid != uid
+            || record.content_hash != blob_hash
+        {
             return Ok(false);
         }
         if record.shard_id != UIDONLY_SHARD_ID {
@@ -443,12 +491,13 @@ impl CanonicalArchive for BichonCanonicalArchive {
         uid: u32,
         content_hash: &str,
         envelope_id: Option<&str>,
+        raw: Option<&[u8]>,
     ) -> BichonResult<()> {
         let _write_guard = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
         let envelope_id = envelope_id
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| self.envelope_id(uid, content_hash));
-        rollback_uidonly_message(self.account_id, &envelope_id, content_hash).await
+        rollback_uidonly_message(self.account_id, &envelope_id, content_hash, raw).await
     }
 }
 
@@ -459,6 +508,7 @@ pub(crate) struct AcquisitionReport {
     pub processed: u64,
     pub checkpoint: Option<u32>,
     pub success: bool,
+    pub vanished_ranges: Vec<UidRange>,
     pub states: BTreeMap<u32, UidState>,
     #[cfg(test)]
     state_bytes_written: u64,
@@ -478,8 +528,12 @@ struct DurableArchive {
 struct LedgerMetadata {
     identity: AcquisitionIdentity,
     uid_validity: u32,
+    #[serde(default = "first_uid")]
+    snapshot_start: u32,
     snapshot_end: u32,
     checkpoint: Option<u32>,
+    #[serde(default)]
+    vanished_ranges: Vec<UidRange>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -600,8 +654,10 @@ impl DurableArchive {
                 AcquisitionLedger {
                     identity: metadata.identity,
                     uid_validity: metadata.uid_validity,
+                    snapshot_start: metadata.snapshot_start,
                     snapshot_end: metadata.snapshot_end,
                     checkpoint: metadata.checkpoint,
+                    vanished_ranges: metadata.vanished_ranges,
                     entries: BTreeMap::new(),
                 }
             };
@@ -642,8 +698,10 @@ impl DurableArchive {
         let ledger = AcquisitionLedger {
             identity,
             uid_validity,
+            snapshot_start: 1,
             snapshot_end,
             checkpoint: None,
+            vanished_ranges: Vec::new(),
             entries: BTreeMap::new(),
         };
         self.persist_metadata(&ledger)?;
@@ -654,8 +712,10 @@ impl DurableArchive {
         let bytes = serde_json::to_vec(&LedgerMetadata {
             identity: ledger.identity.clone(),
             uid_validity: ledger.uid_validity,
+            snapshot_start: ledger.snapshot_start,
             snapshot_end: ledger.snapshot_end,
             checkpoint: ledger.checkpoint,
+            vanished_ranges: ledger.vanished_ranges.clone(),
         })
         .map_err(|e| {
             raise_error!(
@@ -763,6 +823,42 @@ impl DurableArchive {
         atomic_write(&record_path, &record)?;
 
         Ok((hash, raw.len() as u64))
+    }
+
+    fn read_staged_raw(
+        &self,
+        ledger: &AcquisitionLedger,
+        uid: u32,
+        expected_hash: &str,
+    ) -> BichonResult<Vec<u8>> {
+        let record_path = self.epoch_dir.join("records").join(format!("{uid}.json"));
+        let record: StagingRecord = serde_json::from_slice(
+            &fs::read(&record_path).map_err(io_error)?,
+        )
+        .map_err(|error| {
+            raise_error!(
+                format!("invalid UIDONLY staging record for UID {uid}: {error}"),
+                ErrorCode::InternalError
+            )
+        })?;
+        if record.identity != ledger.identity
+            || record.uid_validity != ledger.uid_validity
+            || record.uid != uid
+            || record.blob_hash != expected_hash
+        {
+            return Err(raise_error!(
+                format!("UIDONLY staging record identity mismatch for UID {uid}"),
+                ErrorCode::Incompatible
+            ));
+        }
+        let raw = fs::read(self.epoch_dir.join("blobs").join(expected_hash)).map_err(io_error)?;
+        if raw.len() as u64 != record.bytes || compute_content_hash(&raw) != expected_hash {
+            return Err(raise_error!(
+                format!("UIDONLY staging blob verification failed for UID {uid}"),
+                ErrorCode::InternalError
+            ));
+        }
+        Ok(raw)
     }
 
     fn reclaim_committed_staging(&self, ledger: &AcquisitionLedger) -> BichonResult<()> {
@@ -1088,10 +1184,11 @@ async fn cleanup_canonical<C: CanonicalArchive>(
     uid: u32,
     content_hash: &str,
     envelope_id: Option<&str>,
+    raw: Option<&[u8]>,
 ) -> BichonResult<()> {
     tokio::time::timeout(
         CANONICAL_CLEANUP_GRACE,
-        canonical.rollback(uid, content_hash, envelope_id),
+        canonical.rollback(uid, content_hash, envelope_id, raw),
     )
     .await
     .map_err(|_| {
@@ -1100,6 +1197,39 @@ async fn cleanup_canonical<C: CanonicalArchive>(
             ErrorCode::RequestTimeout
         )
     })?
+}
+
+fn record_vanished_ranges(
+    ranges: &mut Vec<UidRange>,
+    additions: impl IntoIterator<Item = RangeInclusive<u32>>,
+    snapshot_start: u32,
+    snapshot_end: u32,
+) -> bool {
+    let mut changed = false;
+    for range in additions {
+        let start = (*range.start()).max(snapshot_start);
+        let end = (*range.end()).min(snapshot_end);
+        if start <= end {
+            ranges.push(UidRange { start, end });
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<UidRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut() {
+            if range.start <= previous.end.saturating_add(1) {
+                previous.end = previous.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+    changed
 }
 
 async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
@@ -1113,9 +1243,16 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
 ) -> BichonResult<AcquisitionReport> {
     let started = Instant::now();
     let snapshot = bounded_transport(transport.snapshot(mailbox), started, limits, &token).await?;
+    canonical.begin_epoch(snapshot.uid_validity)?;
     let snapshot_end = snapshot.uid_next.saturating_sub(1);
     let archive = DurableArchive::open(root, &identity, snapshot.uid_validity, limits)?;
     let mut ledger = archive.load_or_create(identity, snapshot.uid_validity, snapshot_end)?;
+    if ledger.checkpoint == Some(ledger.snapshot_end) && snapshot_end > ledger.snapshot_end {
+        ledger.snapshot_start = ledger.snapshot_end.saturating_add(1);
+        ledger.snapshot_end = snapshot_end;
+        ledger.checkpoint = None;
+        archive.persist_metadata(&ledger)?;
+    }
     let existing_canonical_bytes = ledger
         .entries
         .values()
@@ -1147,7 +1284,8 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
         })
         .collect();
     for (uid, blob_hash, canonical_bytes) in interrupted {
-        cleanup_canonical(canonical, uid, &blob_hash, None).await?;
+        let raw = archive.read_staged_raw(&ledger, uid, &blob_hash)?;
+        cleanup_canonical(canonical, uid, &blob_hash, None, Some(&raw)).await?;
         archive.release_disk(canonical_bytes);
         ledger.entries.get_mut(&uid).unwrap().state = UidState::Missing;
         archive.persist_entry(uid, &ledger.entries[&uid])?;
@@ -1191,7 +1329,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
             None => false,
         };
         if !valid {
-            cleanup_canonical(canonical, uid, &blob_hash, envelope_id.as_deref()).await?;
+            cleanup_canonical(canonical, uid, &blob_hash, envelope_id.as_deref(), None).await?;
             archive.release_disk(canonical_bytes);
             ledger.entries.get_mut(&uid).unwrap().state = UidState::Failed {
                 reason: "committed canonical record or blob failed restart validation".into(),
@@ -1208,7 +1346,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
     let snapshot_end = ledger.snapshot_end;
 
     let page_size = limits.page_size.max(1);
-    let mut first_uid = 1u32;
+    let mut first_uid = ledger.snapshot_start;
     while first_uid <= snapshot_end {
         validate_runtime(started, limits, &token)?;
         let page = bounded_transport(
@@ -1218,6 +1356,21 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
             &token,
         )
         .await?;
+        if page.items.len() > page_size as usize {
+            return Err(raise_error!(
+                format!(
+                    "UIDONLY server returned {} inventory items for requested page size {page_size}",
+                    page.items.len()
+                ),
+                ErrorCode::ImapUnexpectedResult
+            ));
+        }
+        let metadata_changed = record_vanished_ranges(
+            &mut ledger.vanished_ranges,
+            page.vanished.iter().cloned(),
+            ledger.snapshot_start,
+            snapshot_end,
+        );
         for range in page.vanished {
             let mut changed = Vec::new();
             for (&uid, entry) in ledger.entries.range_mut(range) {
@@ -1229,6 +1382,18 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
             for uid in changed {
                 archive.persist_entry(uid, &ledger.entries[&uid])?;
             }
+        }
+        if ledger.vanished_ranges.len() > limits.max_messages {
+            return Err(raise_error!(
+                format!(
+                    "UIDONLY VANISHED range ceiling {} exceeded",
+                    limits.max_messages
+                ),
+                ErrorCode::PayloadTooLarge
+            ));
+        }
+        if metadata_changed {
+            archive.persist_metadata(&ledger)?;
         }
         if page.items.is_empty() {
             break;
@@ -1425,6 +1590,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
                                                         uid,
                                                         &blob_hash,
                                                         Some(&projection.envelope_id),
+                                                        Some(&raw),
                                                     )
                                                     .await?;
                                                     archive.release_disk(budget);
@@ -1439,6 +1605,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
                                                     uid,
                                                     &blob_hash,
                                                     Some(&projection.envelope_id),
+                                                    Some(&raw),
                                                 )
                                                 .await?;
                                                 archive.release_disk(budget);
@@ -1454,6 +1621,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
                                                     uid,
                                                     &blob_hash,
                                                     Some(&projection.envelope_id),
+                                                    Some(&raw),
                                                 )
                                                 .await?;
                                                 archive.release_disk(budget);
@@ -1463,8 +1631,14 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
                                     }
                                     Err(failure) => {
                                         if !failure.cleanup_pending {
-                                            cleanup_canonical(canonical, uid, &blob_hash, None)
-                                                .await?;
+                                            cleanup_canonical(
+                                                canonical,
+                                                uid,
+                                                &blob_hash,
+                                                None,
+                                                Some(&raw),
+                                            )
+                                            .await?;
                                         }
                                         archive.release_disk(budget);
                                         let error = failure.error;
@@ -1521,7 +1695,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
         )
         .await?
         {
-            cleanup_canonical(canonical, uid, &blob_hash, Some(&envelope_id)).await?;
+            cleanup_canonical(canonical, uid, &blob_hash, Some(&envelope_id), None).await?;
             archive.release_disk(canonical_bytes);
             ledger.entries.get_mut(&uid).unwrap().state = UidState::Failed {
                 reason: "canonical record failed final checkpoint revalidation".into(),
@@ -1554,6 +1728,7 @@ async fn run_acquisition<T: UidOnlyTransport, C: CanonicalArchive>(
         processed,
         checkpoint: ledger.checkpoint,
         success,
+        vanished_ranges: ledger.vanished_ranges,
         states: ledger
             .entries
             .into_iter()
@@ -1668,6 +1843,11 @@ impl UidOnlyTransport for SessionUidOnlyTransport {
             .map_err(classify_transport)?;
         let mut items = Vec::new();
         while let Some(fetch) = stream.try_next().await.map_err(classify_transport)? {
+            if items.len() >= page_size as usize {
+                return Err(TransportFailure::command(format!(
+                    "server exceeded requested UIDONLY inventory page size {page_size}"
+                )));
+            }
             items.push(InventoryItem {
                 uid: fetch.uid,
                 size: fetch.size.map(u64::from),
@@ -1898,6 +2078,37 @@ mod tests {
         }
     }
 
+    struct OverfullInventoryTransport;
+
+    impl UidOnlyTransport for OverfullInventoryTransport {
+        async fn snapshot(&mut self, _mailbox: &str) -> Result<Snapshot, TransportFailure> {
+            Ok(Snapshot {
+                uid_validity: 9,
+                uid_next: 4,
+            })
+        }
+
+        async fn inventory_page(
+            &mut self,
+            _first_uid: u32,
+            _snapshot_end: u32,
+            _page_size: u32,
+        ) -> Result<InventoryPage, TransportFailure> {
+            Ok(InventoryPage {
+                items: vec![item(1, 1), item(2, 1), item(3, 1)],
+                vanished: Vec::new(),
+            })
+        }
+
+        async fn fetch_uid(&mut self, _uid: u32) -> Result<FetchOutcome, TransportFailure> {
+            panic!("overfull inventory must be rejected before body fetch")
+        }
+
+        async fn reconnect(&mut self) -> Result<(), TransportFailure> {
+            Ok(())
+        }
+    }
+
     struct HangingTransport;
 
     impl UidOnlyTransport for HangingTransport {
@@ -1935,9 +2146,14 @@ mod tests {
         verify_calls: Cell<usize>,
         active_projects: usize,
         quiesced_projects: Vec<u32>,
+        rollback_raw_hashes: Vec<(u32, String)>,
     }
 
     impl CanonicalArchive for FakeCanonicalArchive {
+        fn begin_epoch(&mut self, _uid_validity: u32) -> BichonResult<()> {
+            Ok(())
+        }
+
         fn disk_budget(&self, raw: &[u8]) -> BichonResult<u64> {
             Ok(self.disk_budget_override.unwrap_or(raw.len() as u64 + 128))
         }
@@ -1991,7 +2207,12 @@ mod tests {
             uid: u32,
             _content_hash: &str,
             _envelope_id: Option<&str>,
+            raw: Option<&[u8]>,
         ) -> BichonResult<()> {
+            if let Some(raw) = raw {
+                self.rollback_raw_hashes
+                    .push((uid, compute_content_hash(raw)));
+            }
             self.records.remove(&uid);
             Ok(())
         }
@@ -2016,6 +2237,7 @@ mod tests {
             "expected-hash",
             crate::store::tantivy::envelope::CanonicalProjectionRecord {
                 envelope_id: "legacy-envelope".into(),
+                uid: 7,
                 content_hash: "expected-hash".into(),
                 shard_id: 0,
                 attachments: Vec::new(),
@@ -2043,6 +2265,13 @@ mod tests {
         }];
         assert_eq!(expected.len(), actual.len());
         assert_ne!(expected, actual);
+    }
+
+    #[test]
+    fn canonical_identity_is_scoped_to_uidvalidity_epoch() {
+        let first = BichonCanonicalArchive::envelope_id_for(7, 11, 9, 42, "same-hash");
+        let second = BichonCanonicalArchive::envelope_id_for(7, 11, 10, 42, "same-hash");
+        assert_ne!(first, second);
     }
 
     fn identity() -> AcquisitionIdentity {
@@ -2712,6 +2941,12 @@ mod tests {
         .unwrap();
         assert!(report.success);
         assert!(canonical.records.contains_key(&1));
+        assert!(
+            canonical
+                .rollback_raw_hashes
+                .contains(&(1, compute_content_hash(b"mail"))),
+            "restart rollback must recover attachment cleanup evidence from staged raw bytes"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2758,6 +2993,7 @@ AQIDBA==\r\n\
         }])
         .unwrap();
         let mut canonical = BichonCanonicalArchive::new(account_id, mailbox_id);
+        canonical.begin_epoch(9).unwrap();
         let first = canonical
             .project(first_uid, raw, None, CancellationToken::new())
             .await
@@ -2806,6 +3042,22 @@ AQIDBA==\r\n\
                 .await
                 .unwrap());
         }
+
+        canonical.begin_epoch(10).unwrap();
+        let next_epoch = canonical
+            .project(first_uid, raw, None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(first.envelope_id, next_epoch.envelope_id);
+        let next_epoch_record = ENVELOPE_MANAGER
+            .get_projection_by_envelope_id(account_id, &next_epoch.envelope_id)
+            .unwrap()
+            .expect("UID reuse in a new UIDVALIDITY epoch must create a distinct record");
+        assert_eq!(next_epoch_record.uid, first_uid);
+        assert!(canonical
+            .verify(first_uid, &next_epoch.content_hash, &next_epoch.envelope_id)
+            .await
+            .unwrap());
 
         let failed_uid = 79;
         // The failed writer reuses the exact email and attachment blobs owned
@@ -2998,6 +3250,125 @@ AQIDBA==\r\n\
             .states
             .values()
             .all(|state| matches!(state, UidState::Vanished)));
+        assert_eq!(
+            report.vanished_ranges,
+            vec![UidRange {
+                start: 1,
+                end: u32::MAX - 1,
+            }]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unseen_vanished_range_is_durable_compact_evidence() {
+        let root = temp_root("unseen-vanished-evidence");
+        let report = run_acquisition(
+            &mut HugeVanishedTransport,
+            &mut FakeCanonicalArchive::default(),
+            "INBOX",
+            identity(),
+            &root,
+            limits(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(report.success);
+        assert_eq!((report.planned, report.processed), (0, 0));
+        assert_eq!(
+            report.vanished_ranges,
+            vec![UidRange {
+                start: 1,
+                end: u32::MAX - 1,
+            }]
+        );
+        let archive = DurableArchive::open(&root, &identity(), 9, limits()).unwrap();
+        let ledger = archive.load_or_create(identity(), 9, u32::MAX - 1).unwrap();
+        assert_eq!(ledger.vanished_ranges, report.vanished_ranges);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_cannot_overrun_requested_partial_page() {
+        let root = temp_root("overfull-partial");
+        let error = run_acquisition(
+            &mut OverfullInventoryTransport,
+            &mut FakeCanonicalArchive::default(),
+            "INBOX",
+            identity(),
+            &root,
+            limits(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::ImapUnexpectedResult);
+        let archive = DurableArchive::open(&root, &identity(), 9, limits()).unwrap();
+        let ledger = archive.load_or_create(identity(), 9, 3).unwrap();
+        assert_eq!(ledger.checkpoint, None);
+        assert!(ledger.entries.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_extends_from_prior_checkpoint() {
+        let root = temp_root("periodic-window");
+        let mut canonical = FakeCanonicalArchive::default();
+        let mut first = FakeTransport {
+            snapshot: Snapshot {
+                uid_validity: 9,
+                uid_next: 2,
+            },
+            inventory: vec![item(1, 1)],
+            outcomes: [(1, VecDeque::from([message(b"a")]))].into(),
+            vanished_on_inventory: BTreeSet::new(),
+            expunge_after_first_page: None,
+            reconnects: 0,
+            page_requests: Vec::new(),
+        };
+        assert!(
+            run_acquisition(
+                &mut first,
+                &mut canonical,
+                "INBOX",
+                identity(),
+                &root,
+                limits(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .success
+        );
+
+        let mut second = FakeTransport {
+            snapshot: Snapshot {
+                uid_validity: 9,
+                uid_next: 3,
+            },
+            inventory: vec![item(1, 1), item(2, 1)],
+            outcomes: [(2, VecDeque::from([message(b"b")]))].into(),
+            vanished_on_inventory: BTreeSet::new(),
+            expunge_after_first_page: None,
+            reconnects: 0,
+            page_requests: Vec::new(),
+        };
+        let report = run_acquisition(
+            &mut second,
+            &mut canonical,
+            "INBOX",
+            identity(),
+            &root,
+            limits(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(report.success);
+        assert_eq!(report.checkpoint, Some(2));
+        assert_eq!(second.page_requests.first(), Some(&(2, 2, 2)));
+        assert_eq!(canonical.projected_uids, vec![1, 2]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3085,8 +3456,8 @@ AQIDBA==\r\n\
             )
             .await;
             match case {
-                "messages" | "disk" => assert!(result.is_err()),
-                "total-bytes" => {
+                "messages" => assert!(result.is_err()),
+                "total-bytes" | "disk" => {
                     let report = result.unwrap();
                     assert!(!report.success);
                     assert_eq!(report.checkpoint, None);

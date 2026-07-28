@@ -93,6 +93,7 @@ pub struct IndexManager {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalProjectionRecord {
     pub envelope_id: String,
+    pub uid: u32,
     pub content_hash: String,
     pub shard_id: u64,
     pub attachments: Vec<AttachmentInfo>,
@@ -252,6 +253,7 @@ impl IndexManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn get_projection_by_uid(
         &self,
         account_id: u64,
@@ -311,6 +313,98 @@ impl IndexManager {
                     )
                 })?
                 .to_string(),
+            uid: doc
+                .get_first(fields.f_uid)
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no valid UID".into(),
+                        ErrorCode::InternalError
+                    )
+                })?,
+            content_hash: doc
+                .get_first(fields.f_content_hash)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no content hash".into(),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .to_string(),
+            shard_id: doc
+                .get_first(fields.f_shard_id)
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no shard id".into(),
+                        ErrorCode::InternalError
+                    )
+                })?,
+            attachments: doc
+                .get_first(fields.f_attachments)
+                .and_then(|value| value.as_str())
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| {
+                    raise_error!(
+                        format!("canonical UID record has invalid attachment metadata: {e}"),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .unwrap_or_default(),
+        }))
+    }
+
+    pub(crate) fn get_projection_by_envelope_id(
+        &self,
+        account_id: u64,
+        envelope_id: &str,
+    ) -> BichonResult<Option<CanonicalProjectionRecord>> {
+        let fields = SchemaTools::email_fields();
+        let searcher = self.create_searcher()?;
+        let docs = searcher
+            .search(
+                self.envelope_query(account_id, envelope_id).as_ref(),
+                &TopDocs::with_limit(2).order_by_score(),
+            )
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        if docs.len() > 1 {
+            return Err(raise_error!(
+                format!(
+                    "multiple canonical records exist for account {account_id}, envelope {envelope_id}"
+                ),
+                ErrorCode::Incompatible
+            ));
+        }
+        let Some((_, address)) = docs.first() else {
+            return Ok(None);
+        };
+        let doc = searcher
+            .doc::<TantivyDocument>(*address)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
+        Ok(Some(CanonicalProjectionRecord {
+            envelope_id: doc
+                .get_first(fields.f_id)
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no envelope id".into(),
+                        ErrorCode::InternalError
+                    )
+                })?
+                .to_string(),
+            uid: doc
+                .get_first(fields.f_uid)
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "canonical UID record has no valid UID".into(),
+                        ErrorCode::InternalError
+                    )
+                })?,
             content_hash: doc
                 .get_first(fields.f_content_hash)
                 .and_then(|value| value.as_str())

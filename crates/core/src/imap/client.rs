@@ -21,10 +21,11 @@ use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
 use crate::imap::session::SessionStream;
 use crate::imap::stats::StatsWrapper;
+use crate::raise_error;
 use crate::utils::net::establish_tcp_connection_with_timeout;
 use crate::utils::net::establish_tls_connection;
 use crate::utils::tls::establish_tls_stream;
-use crate::raise_error;
+use async_imap::types::ResponseLimits;
 use async_imap::Client as ImapClient;
 use async_imap::Session as ImapSession;
 use std::net::SocketAddr;
@@ -120,17 +121,43 @@ impl Client {
         use_proxy: Option<u64>,
         dangerous: bool,
     ) -> BichonResult<Self> {
+        Self::connection_with_limits(domain, encryption, port, use_proxy, dangerous, None).await
+    }
+
+    pub(crate) async fn connection_with_limits(
+        domain: &str,
+        encryption: &Encryption,
+        port: u16,
+        use_proxy: Option<u64>,
+        dangerous: bool,
+        response_limits: Option<ResponseLimits>,
+    ) -> BichonResult<Self> {
         let resolved_addr = Self::resolve_to_socket_addr(domain, port)?;
         debug!("Attempting IMAP connection to {domain} ({resolved_addr}).");
         match encryption {
             Encryption::Ssl => {
-                Self::establish_secure_connection(resolved_addr, domain, use_proxy, dangerous).await
+                Self::establish_secure_connection(
+                    resolved_addr,
+                    domain,
+                    use_proxy,
+                    dangerous,
+                    response_limits,
+                )
+                .await
             }
             Encryption::StartTls => {
-                Self::establish_starttls_connection(resolved_addr, domain, use_proxy, dangerous)
-                    .await
+                Self::establish_starttls_connection(
+                    resolved_addr,
+                    domain,
+                    use_proxy,
+                    dangerous,
+                    response_limits,
+                )
+                .await
             }
-            Encryption::None => Self::establish_insecure_connection(resolved_addr, use_proxy).await,
+            Encryption::None => {
+                Self::establish_insecure_connection(resolved_addr, use_proxy, response_limits).await
+            }
         }
     }
 
@@ -139,6 +166,7 @@ impl Client {
         server_hostname: &str,
         use_proxy: Option<u64>,
         dangerous: bool,
+        response_limits: Option<ResponseLimits>,
     ) -> BichonResult<Self> {
         // Establish the TLS connection with the specified parameters
         let tls_stream = establish_tls_connection(
@@ -156,6 +184,11 @@ impl Client {
         let session_stream = Box::new(buffered_stream);
         // Initialize the client with the session stream
         let mut client = Client::new(session_stream);
+        if let Some(limits) = response_limits {
+            client.set_response_limits(limits).map_err(|error| {
+                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
+            })?;
+        }
         // Read and validate the greeting response
         let _greeting = client
             .read_response()
@@ -175,6 +208,7 @@ impl Client {
     async fn establish_insecure_connection(
         address: SocketAddr,
         use_proxy: Option<u64>,
+        response_limits: Option<ResponseLimits>,
     ) -> BichonResult<Self> {
         // Establish the TCP connection without encryption
         let tcp_stream = establish_tcp_connection_with_timeout(address, use_proxy).await?;
@@ -185,6 +219,11 @@ impl Client {
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         // Initialize the client with the session stream
         let mut client = Client::new(session_stream);
+        if let Some(limits) = response_limits {
+            client.set_response_limits(limits).map_err(|error| {
+                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
+            })?;
+        }
 
         // Read and validate the greeting response
         let _greeting = client
@@ -207,6 +246,7 @@ impl Client {
         server_hostname: &str,
         use_proxy: Option<u64>,
         dangerous: bool,
+        response_limits: Option<ResponseLimits>,
     ) -> BichonResult<Self> {
         // Establish the initial TCP connection
         let tcp_stream = establish_tcp_connection_with_timeout(address, use_proxy).await?;
@@ -216,6 +256,11 @@ impl Client {
 
         // Create a client for communication
         let mut client = async_imap::Client::new(buffered_tcp_stream);
+        if let Some(limits) = response_limits {
+            client.set_response_limits(limits).map_err(|error| {
+                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
+            })?;
+        }
 
         // Read and validate the greeting response
         let _greeting = client
@@ -250,7 +295,12 @@ impl Client {
         // Create a SessionStream trait object for further communication
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         // Initialize the client with the session stream
-        let client = Client::new(session_stream);
+        let mut client = Client::new(session_stream);
+        if let Some(limits) = response_limits {
+            client.set_response_limits(limits).map_err(|error| {
+                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
+            })?;
+        }
         // Return the established client
         Ok(client)
     }
@@ -274,5 +324,33 @@ impl Client {
         socket_addrs.into_iter().next().ok_or_else(|| {
             raise_error!("Unable to resolve address".into(), ErrorCode::NetworkError)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imap::mock_server::MockImapServer;
+
+    #[tokio::test]
+    async fn acquisition_limits_apply_before_server_greeting() {
+        let server = MockImapServer::new()
+            .greeting(format!("* OK {}\r\n", "x".repeat(128)))
+            .start()
+            .await;
+        let error = Client::connection_with_limits(
+            &server.host(),
+            &Encryption::None,
+            server.port(),
+            None,
+            false,
+            Some(ResponseLimits::new(32, 32)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ResponseTooLarge")
+                || error.to_string().contains("response")
+        );
     }
 }

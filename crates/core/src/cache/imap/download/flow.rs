@@ -36,7 +36,9 @@ use crate::{
             compress_uid_list, generate_uid_sequence_hashset, ImapExecutor, DEFAULT_BATCH_SIZE,
         },
         imap::manager::{AcquisitionConnection, ImapConnectionManager},
-        imap::uidonly_acquisition::{acquire_bichon_mailbox, AcquisitionLimits},
+        imap::uidonly_acquisition::{
+            acquire_bichon_mailbox, AcquisitionLimits, AcquisitionReport,
+        },
         settings::dir::DATA_DIR_MANAGER,
         store::tantivy::envelope::ENVELOPE_MANAGER,
     },
@@ -46,6 +48,86 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const MAX_NETWORK_RETRIES: u32 = 3;
+
+async fn build_bounded_acquisition(
+    account_id: u64,
+    limits: AcquisitionLimits,
+    token: &CancellationToken,
+) -> BichonResult<(AcquisitionConnection, AcquisitionLimits)> {
+    let started = Instant::now();
+    let response_limits = limits.response_limits()?;
+    let connection = tokio::select! {
+        _ = token.cancelled() => return Err(raise_error!(
+            "UIDONLY acquisition cancelled while connecting".into(),
+            ErrorCode::InternalError
+        )),
+        result = tokio::time::timeout(
+            limits.max_runtime,
+            ImapConnectionManager::build_acquisition(account_id, response_limits),
+        ) => result.map_err(|_| raise_error!(
+            "UIDONLY acquisition runtime ceiling exceeded while connecting".into(),
+            ErrorCode::RequestTimeout
+        ))??,
+    };
+    let remaining = limits
+        .max_runtime
+        .checked_sub(started.elapsed())
+        .ok_or_else(|| {
+            raise_error!(
+                "UIDONLY acquisition runtime ceiling exceeded while connecting".into(),
+                ErrorCode::RequestTimeout
+            )
+        })?;
+    Ok((
+        connection,
+        AcquisitionLimits {
+            max_runtime: remaining,
+            ..limits
+        },
+    ))
+}
+
+async fn acquire_and_validate_uidonly(
+    account: &AccountModel,
+    mailbox: &MailBox,
+    session: async_imap::Session<Box<dyn crate::imap::session::SessionStream>>,
+    message_limit: Option<u32>,
+    limits: AcquisitionLimits,
+    token: CancellationToken,
+) -> BichonResult<AcquisitionReport> {
+    let root = DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition");
+    let report = acquire_bichon_mailbox(
+        account,
+        mailbox,
+        session,
+        message_limit,
+        &root,
+        limits,
+        token,
+    )
+    .await?;
+    DownloadState::update_folder_progress(
+        account.id,
+        mailbox.name.clone(),
+        report.planned,
+        report.processed,
+        if report.success {
+            FolderStatus::Success
+        } else {
+            FolderStatus::Failed
+        },
+        (!report.success).then(|| {
+            "UIDONLY snapshot contains unresolved UIDs; checkpoint was not advanced".to_string()
+        }),
+    )?;
+    if !report.success {
+        return Err(raise_error!(
+            "UIDONLY snapshot incomplete; see durable per-UID ledger".into(),
+            ErrorCode::ImapUnexpectedResult
+        ));
+    }
+    Ok(report)
+}
 
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,49 +365,25 @@ pub async fn fetch_and_save_full_mailbox(
     let account_id = account.id;
 
     let limits = AcquisitionLimits::for_account(account);
-    let connection = ImapConnectionManager::build_acquisition(
-        account_id,
-        limits.response_limits()?,
-    )
-    .await;
+    let connection = build_bounded_acquisition(account_id, limits, &token).await;
     let mut session = match connection {
-        Ok(AcquisitionConnection::Standard(session)) => session,
-        Ok(AcquisitionConnection::UidOnly {
-            session,
-            message_limit,
-        }) => {
-            let root = DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition");
-            let report = acquire_bichon_mailbox(
+        Ok((AcquisitionConnection::Standard(session), _)) => session,
+        Ok((
+            AcquisitionConnection::UidOnly {
+                session,
+                message_limit,
+            },
+            remaining_limits,
+        )) => {
+            let report = acquire_and_validate_uidonly(
                 account,
                 mailbox,
                 session,
                 message_limit,
-                &root,
-                limits,
+                remaining_limits,
                 token,
             )
             .await?;
-            DownloadState::update_folder_progress(
-                account_id,
-                mailbox.name.clone(),
-                report.planned,
-                report.processed,
-                if report.success {
-                    FolderStatus::Success
-                } else {
-                    FolderStatus::Failed
-                },
-                (!report.success).then(|| {
-                    "UIDONLY snapshot contains unresolved UIDs; checkpoint was not advanced"
-                        .to_string()
-                }),
-            )?;
-            if !report.success {
-                return Err(raise_error!(
-                    "UIDONLY snapshot incomplete; see durable per-UID ledger".into(),
-                    ErrorCode::ImapUnexpectedResult
-                ));
-            }
             let mut updated = mailbox.clone();
             updated.uid_validity = Some(report.uid_validity);
             updated.highest_uid = report.checkpoint;
@@ -1066,7 +1124,47 @@ async fn perform_incremental_sync(
             }
         };
 
-        let mut session = ImapExecutor::create_connection(account.id).await?;
+        if account.date_since.is_some() || account.date_before.is_some() {
+            let mut session = ImapExecutor::create_connection(account.id).await?;
+            let before_date = account
+                .date_before
+                .as_ref()
+                .map(|r| r.calculate_date())
+                .transpose()?;
+            let new_max_uid = ImapExecutor::fetch_new_mail(
+                &mut session,
+                account,
+                local_mailbox,
+                start_uid,
+                before_date.as_deref(),
+                token,
+            )
+            .await?;
+            session.logout().await.ok();
+            return Ok(new_max_uid.or(local_mailbox.highest_uid));
+        }
+
+        let limits = AcquisitionLimits::for_account(account);
+        let (connection, remaining_limits) =
+            build_bounded_acquisition(account.id, limits, &token).await?;
+        let mut session = match connection {
+            AcquisitionConnection::Standard(session) => session,
+            AcquisitionConnection::UidOnly {
+                session,
+                message_limit,
+            } => {
+                let report = acquire_and_validate_uidonly(
+                    account,
+                    remote_mailbox,
+                    session,
+                    message_limit,
+                    remaining_limits,
+                    token,
+                )
+                .await?;
+                return Ok(report.checkpoint);
+            }
+        };
         let before_date = account
             .date_before
             .as_ref()

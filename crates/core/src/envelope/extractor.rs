@@ -501,18 +501,27 @@ pub(crate) async fn rollback_uidonly_message(
     account_id: u64,
     envelope_id: &str,
     email_content_hash: &str,
+    raw: Option<&[u8]>,
 ) -> BichonResult<()> {
     let mut cleanup_errors = Vec::new();
-    let attachment_hashes = match ATTACHMENT_MANAGER
+    let mut attachment_hashes: std::collections::HashSet<String> = raw
+        .and_then(|body| MessageParser::new().parse(body))
+        .map(|message| {
+            message
+                .attachments()
+                .map(|attachment| compute_content_hash(attachment.contents()))
+                .collect()
+        })
+        .unwrap_or_default();
+    match ATTACHMENT_MANAGER
         .rollback_documents(account_id, envelope_id)
         .await
     {
-        Ok(hashes) => hashes,
+        Ok(hashes) => attachment_hashes.extend(hashes),
         Err(error) => {
             cleanup_errors.push(error.to_string());
-            std::collections::HashSet::new()
         }
-    };
+    }
     if let Err(error) = ENVELOPE_MANAGER
         .rollback_uidonly_projection(
             account_id,

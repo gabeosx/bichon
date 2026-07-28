@@ -26,8 +26,8 @@ use crate::imap::oauth2::OAuth2;
 use crate::imap::session::SessionStream;
 use crate::oauth2::token::OAuth2AccessToken;
 use crate::{bichon_version, decrypt, raise_error};
-use async_imap::Session;
 use async_imap::types::ResponseLimits;
+use async_imap::Session;
 use tracing::{error, warn};
 
 pub struct ImapConnectionManager;
@@ -57,15 +57,19 @@ pub(crate) enum AcquisitionConnection {
 }
 
 impl ImapConnectionManager {
-    async fn create_client(account: &AccountModel) -> BichonResult<Client> {
+    async fn create_client(
+        account: &AccountModel,
+        response_limits: Option<ResponseLimits>,
+    ) -> BichonResult<Client> {
         assert_eq!(account.account_type, AccountType::IMAP);
         let imap = account.imap.as_ref().unwrap();
-        Client::connection(
+        Client::connection_with_limits(
             &imap.host,
             &imap.encryption,
             imap.port,
             imap.use_proxy,
             account.use_dangerous,
+            response_limits,
         )
         .await
     }
@@ -119,12 +123,19 @@ impl ImapConnectionManager {
     }
 
     pub async fn build(account_id: u64) -> BichonResult<Session<Box<dyn SessionStream>>> {
+        Self::build_with_limits(account_id, None).await
+    }
+
+    async fn build_with_limits(
+        account_id: u64,
+        response_limits: Option<ResponseLimits>,
+    ) -> BichonResult<Session<Box<dyn SessionStream>>> {
         let account = AccountModel::get(account_id)?;
         let account_email = account.email.clone();
 
         let mut client = None;
         for attempt in 0..3u32 {
-            match Self::create_client(&account).await {
+            match Self::create_client(&account, response_limits).await {
                 Ok(c) => {
                     client = Some(c);
                     break;
@@ -150,7 +161,10 @@ impl ImapConnectionManager {
 
         let client = client.ok_or_else(|| {
             raise_error!(
-                format!("Failed to create IMAP {}'s client after 3 attempts", account_email),
+                format!(
+                    "Failed to create IMAP {}'s client after 3 attempts",
+                    account_email
+                ),
                 ErrorCode::NetworkError
             )
         })?;
@@ -204,7 +218,7 @@ impl ImapConnectionManager {
         account_id: u64,
         response_limits: ResponseLimits,
     ) -> BichonResult<AcquisitionConnection> {
-        let mut session = Self::build(account_id).await?;
+        let mut session = Self::build_with_limits(account_id, Some(response_limits)).await?;
         let capabilities = fetch_capabilities(&mut session).await?;
 
         if acquisition_route(capabilities.has_str("UIDONLY")) == AcquisitionRoute::Standard {

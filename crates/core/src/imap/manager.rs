@@ -27,9 +27,34 @@ use crate::imap::session::SessionStream;
 use crate::oauth2::token::OAuth2AccessToken;
 use crate::{bichon_version, decrypt, raise_error};
 use async_imap::Session;
+use async_imap::types::ResponseLimits;
 use tracing::{error, warn};
 
 pub struct ImapConnectionManager;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcquisitionRoute {
+    Standard,
+    UidOnly,
+}
+
+fn acquisition_route(uidonly_advertised: bool) -> AcquisitionRoute {
+    if uidonly_advertised {
+        AcquisitionRoute::UidOnly
+    } else {
+        AcquisitionRoute::Standard
+    }
+}
+
+/// An authenticated acquisition connection. Existing callers keep using
+/// `build`; only the archive acquisition path opts into UIDONLY.
+pub(crate) enum AcquisitionConnection {
+    Standard(Session<Box<dyn SessionStream>>),
+    UidOnly {
+        session: Session<Box<dyn SessionStream>>,
+        message_limit: Option<u32>,
+    },
+}
 
 impl ImapConnectionManager {
     async fn create_client(account: &AccountModel) -> BichonResult<Client> {
@@ -167,5 +192,47 @@ impl ImapConnectionManager {
         }
 
         Ok(session)
+    }
+
+    /// Builds an acquisition connection and enables RFC 9586 UIDONLY before
+    /// any mailbox is selected. Calling this method again after a reconnect
+    /// necessarily re-enables UIDONLY because the mode is connection-scoped.
+    ///
+    /// Servers without UIDONLY return the already-authenticated standard
+    /// session, preserving the pre-existing acquisition behavior.
+    pub(crate) async fn build_acquisition(
+        account_id: u64,
+        response_limits: ResponseLimits,
+    ) -> BichonResult<AcquisitionConnection> {
+        let mut session = Self::build(account_id).await?;
+        let capabilities = fetch_capabilities(&mut session).await?;
+
+        if acquisition_route(capabilities.has_str("UIDONLY")) == AcquisitionRoute::Standard {
+            return Ok(AcquisitionConnection::Standard(session));
+        }
+
+        session
+            .set_response_limits(response_limits)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InvalidParameter))?;
+        session
+            .enable_uidonly()
+            .await
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::ImapCommandFailed))?;
+
+        Ok(AcquisitionConnection::UidOnly {
+            message_limit: capabilities.message_limit(),
+            session,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_uidonly_capabilities_route_to_legacy_standard_acquisition() {
+        assert_eq!(acquisition_route(false), AcquisitionRoute::Standard);
+        assert_eq!(acquisition_route(true), AcquisitionRoute::UidOnly);
     }
 }

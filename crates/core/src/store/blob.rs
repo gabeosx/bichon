@@ -26,7 +26,11 @@ use crate::{
 use bichon_blob::{Codec, Config, Engine};
 use bytes::Bytes;
 
-use std::{io::Cursor, sync::Arc, sync::LazyLock};
+use std::{
+    collections::HashSet,
+    io::Cursor,
+    sync::{Arc, LazyLock, Mutex as StdMutex},
+};
 use tokio::{
     sync::{mpsc, Mutex},
     task::{self, JoinHandle},
@@ -39,9 +43,17 @@ pub struct DetachedEmail {
     pub attachments: Option<Vec<(String, Bytes)>>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DurableBlobWrite {
+    pub email_hash: Option<String>,
+    pub attachment_hashes: Vec<String>,
+    pub bytes_written: u64,
+}
+
 pub struct BlobManager {
     sender: mpsc::Sender<DetachedEmail>,
     engine: Arc<Engine>,
+    write_lock: Arc<StdMutex<()>>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -57,6 +69,59 @@ fn hex_to_key(hex: &str) -> BichonResult<[u8; 32]> {
 }
 
 impl BlobManager {
+    fn store_detached_email(eml: DetachedEmail, engine: &Engine) -> BichonResult<DurableBlobWrite> {
+        let mut written = DurableBlobWrite::default();
+        let mut entries = Vec::new();
+        let mut new_keys = HashSet::new();
+        let (email_hash, email_data) = eml.email;
+        let email_key = hex_to_key(&email_hash)?;
+        if !engine
+            .exists(&email_key)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+        {
+            let bytes = email_data.len() as u64;
+            new_keys.insert(email_key);
+            entries.push((email_key, email_data.to_vec(), Codec::Lz4));
+            written.email_hash = Some(email_hash);
+            written.bytes_written = written.bytes_written.saturating_add(bytes);
+        }
+
+        if let Some(attachments) = eml.attachments {
+            for (attachment_hash, attachment_data) in attachments {
+                let attachment_key = hex_to_key(&attachment_hash)?;
+                if !new_keys.contains(&attachment_key)
+                    && !engine
+                        .exists(&attachment_key)
+                        .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+                {
+                    let bytes = attachment_data.len() as u64;
+                    new_keys.insert(attachment_key);
+                    entries.push((attachment_key, attachment_data.to_vec(), Codec::Lz4));
+                    written.attachment_hashes.push(attachment_hash);
+                    written.bytes_written = written.bytes_written.saturating_add(bytes);
+                }
+            }
+        }
+
+        if let Err(error) = engine
+            .put_batch(&entries)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))
+        {
+            let rollback_keys: Vec<_> = new_keys.into_iter().collect();
+            engine.delete_batch(&rollback_keys).map_err(|rollback_error| {
+                raise_error!(
+                    format!(
+                        "canonical blob write failed ({error}); rollback failed ({rollback_error:#?})"
+                    ),
+                    ErrorCode::InternalError
+                )
+            })?;
+            return Err(error);
+        }
+
+        Ok(written)
+    }
+
     pub async fn shutdown(&self) {
         let mut guard = self.handle.lock().await;
         if let Some(handle) = guard.take() {
@@ -127,8 +192,10 @@ impl BlobManager {
         let engine = Arc::new(engine);
 
         let (sender, mut receiver) = mpsc::channel::<DetachedEmail>(100);
+        let write_lock = Arc::new(StdMutex::new(()));
 
         let engine_bg = Arc::clone(&engine);
+        let handler_write_lock = write_lock.clone();
         let handler = task::spawn(async move {
             let mut shutdown = SIGNAL_MANAGER.subscribe();
             loop {
@@ -141,7 +208,9 @@ impl BlobManager {
                                     batch.push(next_eml);
                                 }
                                 let engine_bg = Arc::clone(&engine_bg);
+                                let write_lock = handler_write_lock.clone();
                                 if let Err(e) = tokio::task::spawn_blocking(move || {
+                                    let _write_guard = write_lock.lock().unwrap();
                                     for eml in batch {
                                         Self::process_detached_email(eml, &engine_bg);
                                     }
@@ -167,7 +236,9 @@ impl BlobManager {
                         );
                         if !remaining.is_empty() {
                             let engine_bg = Arc::clone(&engine_bg);
+                            let write_lock = handler_write_lock.clone();
                             if let Err(e) = tokio::task::spawn_blocking(move || {
+                                let _write_guard = write_lock.lock().unwrap();
                                 for eml in remaining {
                                     Self::process_detached_email(eml, &engine_bg);
                                 }
@@ -185,6 +256,7 @@ impl BlobManager {
         Self {
             sender,
             engine,
+            write_lock,
             handle: Mutex::new(Some(handler)),
         }
     }
@@ -193,6 +265,22 @@ impl BlobManager {
         if let Err(e) = self.sender.send(email).await {
             tracing::error!("BlobManager channel closed, email lost: {:#?}", e);
         }
+    }
+
+    /// Stores a detached message through the canonical blob engine and waits
+    /// for its segment and index metadata to be durably synchronized.
+    pub(crate) async fn store_durable(
+        &self,
+        email: DetachedEmail,
+    ) -> BichonResult<DurableBlobWrite> {
+        let engine = Arc::clone(&self.engine);
+        let write_lock = self.write_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _write_guard = write_lock.lock().unwrap();
+            Self::store_detached_email(email, &engine)
+        })
+        .await
+        .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
     }
 
     pub fn get_email(&self, content_hash: &str) -> BichonResult<Option<Bytes>> {
@@ -236,7 +324,6 @@ impl BlobManager {
                 .delete_batch(&keys)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
         }
-
         Ok(())
     }
 }

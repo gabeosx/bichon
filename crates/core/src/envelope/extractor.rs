@@ -27,6 +27,7 @@ use crate::imap::executor::ImapExecutor;
 use crate::message::content::AttachmentInfo;
 use crate::store::blob::{DetachedEmail, BLOB_MANAGER};
 use crate::store::tantivy::attachment::ATTACHMENT_MANAGER;
+use crate::store::tantivy::dedup::UIDONLY_SHARD_ID;
 use crate::store::tantivy::dedup_cache::DEDUP_CACHE;
 use crate::store::tantivy::envelope::ENVELOPE_MANAGER;
 use crate::store::tantivy::model::{AttachmentModel, EnvelopeWithAttachments};
@@ -41,6 +42,24 @@ use tantivy::TantivyDocument;
 use tantivy::schema::Facet;
 use tracing::error;
 use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+static FAIL_UIDONLY_AFTER_ATTACHMENTS: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_uidonly_after_attachments(enabled: bool) {
+    FAIL_UIDONLY_AFTER_ATTACHMENTS.store(enabled, Ordering::Release);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalProjection {
+    pub envelope_id: String,
+    pub content_hash: String,
+}
 
 pub async fn extract_envelope_and_store_it(
     fetch: Fetch,
@@ -64,7 +83,20 @@ pub async fn extract_envelope_and_store_it(
         }
     };
     let size = fetch.size.unwrap_or(body.len() as u32);
-    extract_envelope_core(body, uid, size, internal_date, account_id, mailbox_id).await
+    extract_envelope_core(
+        body,
+        uid,
+        size,
+        internal_date,
+        account_id,
+        mailbox_id,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub async fn extract_envelope_from_eml(
@@ -72,7 +104,20 @@ pub async fn extract_envelope_from_eml(
     account_id: u64,
     mailbox_id: u64,
 ) -> BichonResult<()> {
-    extract_envelope_core(body, 0, body.len() as u32, 0, account_id, mailbox_id).await
+    extract_envelope_core(
+        body,
+        0,
+        body.len() as u32,
+        0,
+        account_id,
+        mailbox_id,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub async fn extract_envelope_from_smtp(
@@ -87,10 +132,48 @@ pub async fn extract_envelope_from_smtp(
         utc_now!(),
         account_id,
         mailbox_id,
+        false,
+        false,
+        None,
+        None,
     )
     .await
+    .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn project_uidonly_message(
+    body: &[u8],
+    uid: u32,
+    size: u32,
+    internal_date: i64,
+    account_id: u64,
+    mailbox_id: u64,
+    envelope_id: String,
+    shutdown: CancellationToken,
+) -> BichonResult<CanonicalProjection> {
+    extract_envelope_core(
+        body,
+        uid,
+        size,
+        internal_date,
+        account_id,
+        mailbox_id,
+        true,
+        true,
+        Some(envelope_id),
+        Some(&shutdown),
+    )
+    .await?
+    .ok_or_else(|| {
+        raise_error!(
+            format!("UID {uid} was not projected into the canonical archive"),
+            ErrorCode::InternalError
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn extract_envelope_core(
     body: &[u8],
     uid: u32,
@@ -98,13 +181,17 @@ async fn extract_envelope_core(
     internal_date: i64,
     account_id: u64,
     mailbox_id: u64,
-) -> BichonResult<()> {
+    durable: bool,
+    preserve_uid_identity: bool,
+    fixed_envelope_id: Option<String>,
+    shutdown: Option<&CancellationToken>,
+) -> BichonResult<Option<CanonicalProjection>> {
     //The content hash of the original raw EML
     let email_content_hash = compute_content_hash(body);
-    if DEDUP_CACHE.contains(account_id, mailbox_id, &email_content_hash) {
+    if !preserve_uid_identity && DEDUP_CACHE.contains(account_id, mailbox_id, &email_content_hash) {
         tracing::debug!("Duplicate email detected");
         //println!("Duplicate email detected");
-        return Ok(());
+        return Ok(None);
     }
     let message: Message<'_> = MessageParser::new().parse(body).ok_or_else(|| {
         raise_error!(
@@ -136,7 +223,7 @@ async fn extract_envelope_core(
                     subject = subject.as_deref().unwrap_or("?"),
                     "Email filtered out by archive rules"
                 );
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -202,9 +289,11 @@ async fn extract_envelope_core(
         .and_then(|add| add.address)
         .unwrap_or_else(|| "unknown".to_string());
     let attachment_count = message.attachment_count();
-    let attachments = detach_and_store_attachments(body, &message, &email_content_hash, account_id, mailbox_id).await;
-
-    let envelope_id = Uuid::new_v4().to_string();
+    let (attachments, detached_email) =
+        prepare_detached_attachments(body, &message, &email_content_hash, account_id, mailbox_id)
+            .await;
+    check_uidonly_projection_cancelled(shutdown)?;
+    let envelope_id = fixed_envelope_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = utc_now!();
 
 
@@ -274,7 +363,7 @@ async fn extract_envelope_core(
         .collect();
 
     let envelope = Envelope {
-        id: envelope_id,
+        id: envelope_id.clone(),
         message_id,
         account_id,
         mailbox_id,
@@ -303,7 +392,10 @@ async fn extract_envelope_core(
         envelope,
         attachments: Some(attachments),
     };
-    let doc = ea.to_document(&body_text, 0)?;
+    let doc = ea.to_document(
+        &body_text,
+        if durable { UIDONLY_SHARD_ID } else { 0 },
+    )?;
     tracing::debug!(
         "[account {}][mailbox {}] extract: uid={} msg_id={} content_hash={}",
         account_id,
@@ -312,12 +404,134 @@ async fn extract_envelope_core(
         &ea.envelope.message_id,
         &ea.envelope.content_hash,
     );
-    ENVELOPE_MANAGER.queue(doc).await;
-    DEDUP_CACHE.insert(account_id, mailbox_id, &email_content_hash);
-    for doc in attachment_docs {
-        ATTACHMENT_MANAGER.queue(doc).await;
+    if durable {
+        BLOB_MANAGER.store_durable(detached_email).await?;
+        let commit_result = async {
+            check_uidonly_projection_cancelled(shutdown)?;
+            ATTACHMENT_MANAGER.commit_documents(attachment_docs).await?;
+            check_uidonly_projection_cancelled(shutdown)?;
+            #[cfg(test)]
+            if FAIL_UIDONLY_AFTER_ATTACHMENTS.load(Ordering::Acquire) {
+                return Err(raise_error!(
+                    "synthetic UIDONLY envelope commit failure".into(),
+                    ErrorCode::InternalError
+                ));
+            }
+            ENVELOPE_MANAGER.commit_document(doc).await?;
+            check_uidonly_projection_cancelled(shutdown)
+        }
+        .await;
+        if let Err(error) = commit_result {
+            rollback_failed_uidonly_projection(
+                account_id,
+                &envelope_id,
+                &email_content_hash,
+                ea.attachments.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            return Err(error);
+        }
+    } else {
+        BLOB_MANAGER.queue(detached_email).await;
+        ENVELOPE_MANAGER.queue(doc).await;
+        for doc in attachment_docs {
+            ATTACHMENT_MANAGER.queue(doc).await;
+        }
     }
-    Ok(())
+    DEDUP_CACHE.insert(account_id, mailbox_id, &email_content_hash);
+    Ok(Some(CanonicalProjection {
+        envelope_id,
+        content_hash: email_content_hash,
+    }))
+}
+
+fn check_uidonly_projection_cancelled(
+    shutdown: Option<&CancellationToken>,
+) -> BichonResult<()> {
+    if shutdown.is_some_and(CancellationToken::is_cancelled) {
+        Err(raise_error!(
+            "UIDONLY canonical projection cancelled".into(),
+            ErrorCode::InternalError
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn rollback_failed_uidonly_projection(
+    account_id: u64,
+    envelope_id: &str,
+    email_content_hash: &str,
+    attachments: &[AttachmentInfo],
+) -> BichonResult<()> {
+    let mut attachment_hashes: std::collections::HashSet<String> = attachments
+        .iter()
+        .map(|attachment| attachment.content_hash.clone())
+        .collect();
+    let mut cleanup_errors = Vec::new();
+    match ATTACHMENT_MANAGER
+        .rollback_documents(account_id, envelope_id)
+        .await
+    {
+        Ok(indexed_hashes) => attachment_hashes.extend(indexed_hashes),
+        Err(error) => cleanup_errors.push(error.to_string()),
+    }
+    if let Err(error) = ENVELOPE_MANAGER
+        .rollback_uidonly_projection(
+            account_id,
+            envelope_id,
+            email_content_hash.to_string(),
+            attachment_hashes,
+        )
+        .await
+    {
+        cleanup_errors.push(error.to_string());
+    }
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(raise_error!(
+            format!("UIDONLY canonical rollback failed: {}", cleanup_errors.join("; ")),
+            ErrorCode::InternalError
+        ))
+    }
+}
+
+pub(crate) async fn rollback_uidonly_message(
+    account_id: u64,
+    envelope_id: &str,
+    email_content_hash: &str,
+) -> BichonResult<()> {
+    let mut cleanup_errors = Vec::new();
+    let attachment_hashes = match ATTACHMENT_MANAGER
+        .rollback_documents(account_id, envelope_id)
+        .await
+    {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            cleanup_errors.push(error.to_string());
+            std::collections::HashSet::new()
+        }
+    };
+    if let Err(error) = ENVELOPE_MANAGER
+        .rollback_uidonly_projection(
+            account_id,
+            envelope_id,
+            email_content_hash.to_string(),
+            attachment_hashes,
+        )
+        .await
+    {
+        cleanup_errors.push(error.to_string());
+    }
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(raise_error!(
+            format!("UIDONLY canonical rollback failed: {}", cleanup_errors.join("; ")),
+            ErrorCode::InternalError
+        ))
+    }
 }
 
 pub fn extract_envelope_from_nested_message(
@@ -426,13 +640,13 @@ pub fn extract_references(message: &Message<'_>) -> Option<Vec<String>> {
     }
 }
 
-pub async fn detach_and_store_attachments(
+async fn prepare_detached_attachments(
     original_body: &[u8],
     message: &Message<'_>,
     eml_content_hash: &str,
     account_id: u64,
     mailbox_id: u64,
-) -> Vec<AttachmentInfo> {
+) -> (Vec<AttachmentInfo>, DetachedEmail) {
     let rules = if account_id > 0 {
         AccountModel::get(account_id)
             .ok()
@@ -597,14 +811,31 @@ pub async fn detach_and_store_attachments(
             }
         }
     }
-    // Step 4: Store the final stripped EML content
-    BLOB_MANAGER
-        .queue(DetachedEmail {
+    (
+        attachment_infos,
+        DetachedEmail {
             email: (eml_content_hash.to_string(), Bytes::from(stripped_eml)),
             attachments: Some(attachments),
-        })
-        .await;
+        },
+    )
+}
 
+pub async fn detach_and_store_attachments(
+    original_body: &[u8],
+    message: &Message<'_>,
+    eml_content_hash: &str,
+    account_id: u64,
+    mailbox_id: u64,
+) -> Vec<AttachmentInfo> {
+    let (attachment_infos, detached_email) = prepare_detached_attachments(
+        original_body,
+        message,
+        eml_content_hash,
+        account_id,
+        mailbox_id,
+    )
+    .await;
+    BLOB_MANAGER.queue(detached_email).await;
     attachment_infos
 }
 
@@ -647,7 +878,7 @@ pub fn reattach_eml_content(
         return Err(raise_error!(
             format!(
                 "Consistency check failed: envelope.attachment_count ({}) does not match attachments.len ({})",
-                e.envelope.attachment_count, 
+                e.envelope.attachment_count,
                 actual_count
             ),
             ErrorCode::InternalError

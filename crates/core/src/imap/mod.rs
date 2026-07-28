@@ -24,6 +24,7 @@ pub mod manager;
 pub mod oauth2;
 pub mod session;
 pub mod stats;
+pub(crate) mod uidonly_acquisition;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

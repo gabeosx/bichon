@@ -3928,7 +3928,7 @@ AQIDBA==\r\n\
     }
 
     #[tokio::test]
-    #[ignore = "requires an explicitly provisioned disposable localhost Cyrus instance"]
+    #[ignore = "run crates/core/tests/cyrus/run.sh"]
     async fn cyrus_uidonly_exact_raw_roundtrip() {
         let port: u16 = std::env::var("BICHON_CYRUS_PORT")
             .expect("BICHON_CYRUS_PORT")
@@ -3940,30 +3940,34 @@ AQIDBA==\r\n\
         assert!(root.is_absolute());
         fs::create_dir_all(&root).unwrap();
 
-        let connect = || async move {
+        let connect = |username: &'static str| async move {
             let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let mut client =
                 async_imap::Client::new(Box::new(TestStream(stream)) as Box<dyn SessionStream>);
             client.read_response().await.unwrap().unwrap();
             client
-                .login("archive-test", "synthetic-only-password")
+                .login(username, "synthetic-only-password")
                 .await
                 .map_err(|(error, _)| error)
                 .unwrap()
         };
+
+        let mut admin = connect("cyrus").await;
+        admin.create("user/archive-test").await.unwrap();
+        admin.logout().await.unwrap();
 
         let raw_messages: [&[u8]; 3] = [
             b"From: one@example.invalid\r\nTo: archive@example.invalid\r\nSubject: one\r\n\r\nfirst\r\n",
             b"From: two@example.invalid\r\nTo: archive@example.invalid\r\nSubject: two\r\n\r\nsecond\r\n",
             b"From: three@example.invalid\r\nTo: archive@example.invalid\r\nSubject: three\r\n\r\nthird\r\n",
         ];
-        let mut seed = connect().await;
+        let mut seed = connect("archive-test").await;
         for raw in raw_messages {
             seed.append("INBOX", None, None, raw).await.unwrap();
         }
         seed.logout().await.unwrap();
 
-        let mut session = connect().await;
+        let mut session = connect("archive-test").await;
         let capabilities = session.capabilities().await.unwrap();
         assert!(capabilities.has_str("UIDONLY"));
         assert!(capabilities.has_str("PARTIAL"));
@@ -4001,7 +4005,7 @@ AQIDBA==\r\n\
         assert_eq!((report.planned, report.processed), (3, 3));
         drop(transport);
 
-        let mut restart_session = connect().await;
+        let mut restart_session = connect("archive-test").await;
         restart_session
             .set_response_limits(response_limits)
             .unwrap();

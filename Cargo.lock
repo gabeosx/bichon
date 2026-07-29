@@ -219,8 +219,8 @@ dependencies = [
 
 [[package]]
 name = "async-imap"
-version = "0.11.2"
-source = "git+https://github.com/gabeosx/async-imap.git?rev=afdb7a51a46a75b175b8aaa642f7ad1328ce868b#afdb7a51a46a75b175b8aaa642f7ad1328ce868b"
+version = "0.11.3"
+source = "git+https://github.com/gabeosx/async-imap.git?rev=905a005234f89d046c2f439cee27daf947917b41#905a005234f89d046c2f439cee27daf947917b41"
 dependencies = [
  "async-channel 2.5.0",
  "async-compression",
@@ -2222,7 +2222,7 @@ dependencies = [
 [[package]]
 name = "imap-proto"
 version = "0.17.0"
-source = "git+https://github.com/gabeosx/tokio-imap?rev=68a4e1dc6beffcb82b9ade4b818d2af8b8594649#68a4e1dc6beffcb82b9ade4b818d2af8b8594649"
+source = "git+https://github.com/gabeosx/tokio-imap?rev=05439a90033d67297892c3fe206b8c4285df3821#05439a90033d67297892c3fe206b8c4285df3821"
 dependencies = [
  "nom 7.1.3",
 ]

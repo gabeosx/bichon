@@ -43,7 +43,7 @@ sysinfo.workspace = true
 num_cpus.workspace = true
 rand.workspace = true
 encoding_rs.workspace = true
-async-imap = { git = "https://github.com/gabeosx/async-imap.git", rev = "afdb7a51a46a75b175b8aaa642f7ad1328ce868b", default-features = false, features = [
+async-imap = { git = "https://github.com/gabeosx/async-imap.git", rev = "905a005234f89d046c2f439cee27daf947917b41", default-features = false, features = [
     "runtime-tokio",
     "compress",
 ] }

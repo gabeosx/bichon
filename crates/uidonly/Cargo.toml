@@ -1,0 +1,13 @@
+[package]
+name = "bichon-uidonly"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+async-imap = { git = "https://github.com/rustmailer/async-imap.git", branch = "main", default-features = false, features = [
+    "runtime-tokio",
+] }
+futures.workspace = true
+imap-proto = "=0.16.7"
+tokio.workspace = true

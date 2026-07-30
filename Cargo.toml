@@ -4,6 +4,7 @@ members = [
     "crates/memdb",
     "crates/core",
     "crates/blob",
+    "crates/uidonly",
     "crates/server",
     "crates/cli",
     "crates/admin",

@@ -127,9 +127,12 @@ before starting reacquisition.
 The UIDONLY typestate is read-only: it exposes EXAMINE, UID inventory, exact
 UID body reads, NOOP, and LOGOUT, with no STORE, COPY, MOVE, APPEND, EXPUNGE,
 or ordinary FETCH surface. Credentials and message literals are never logged.
-Raw messages and attachments are written only to Bichon's configured local
-storage and indexes. This change adds no telemetry, remote storage integration,
-or mailbox mutation command.
+Tagged command rejection diagnostics retain only the matching `NO` or `BAD`
+status class, including when the released parser cannot represent an unknown
+wire response code; response-code payloads and provider text are discarded. Raw
+messages and attachments are written only to Bichon's configured local storage
+and indexes. This change adds no telemetry, remote storage integration, or
+mailbox mutation command.
 
 ## Qualification boundary
 

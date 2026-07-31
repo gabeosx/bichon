@@ -124,16 +124,27 @@ impl CommandLimits {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Provenance {
-    TranslatedUidFetch { leading_uid: u32, wire_bytes: usize },
-    Unchanged { wire_bytes: usize },
+    TranslatedUidFetch {
+        leading_uid: u32,
+        wire_bytes: usize,
+    },
+    TaggedCompletion {
+        tag: Vec<u8>,
+        status: SafeTaggedStatus,
+        has_response_code: bool,
+        wire_bytes: usize,
+    },
+    Unchanged {
+        wire_bytes: usize,
+    },
 }
 
 impl Provenance {
     fn wire_bytes(&self) -> usize {
         match self {
-            Self::TranslatedUidFetch { wire_bytes, .. } | Self::Unchanged { wire_bytes } => {
-                *wire_bytes
-            }
+            Self::TranslatedUidFetch { wire_bytes, .. }
+            | Self::TaggedCompletion { wire_bytes, .. }
+            | Self::Unchanged { wire_bytes } => *wire_bytes,
         }
     }
 }
@@ -240,7 +251,14 @@ impl AdapterHandle {
 
 #[derive(Debug)]
 enum ActiveResponseKind {
-    TranslatedUidFetch { leading_uid: u32 },
+    TranslatedUidFetch {
+        leading_uid: u32,
+    },
+    TaggedCompletion {
+        tag: Vec<u8>,
+        status: SafeTaggedStatus,
+        has_response_code: bool,
+    },
     Unchanged,
 }
 
@@ -519,7 +537,15 @@ impl<T> UidOnlyAdapter<T> {
                         Err(self.poison("raw FETCH is forbidden after UIDONLY activation"))
                     }
                     NumericResponse::Other => {
-                        self.active_kind = Some(ActiveResponseKind::Unchanged);
+                        self.active_kind = Some(
+                            classify_tagged_completion(wire_line)
+                                .map(|completion| ActiveResponseKind::TaggedCompletion {
+                                    tag: completion.tag,
+                                    status: completion.status,
+                                    has_response_code: completion.has_response_code,
+                                })
+                                .unwrap_or(ActiveResponseKind::Unchanged),
+                        );
                         Ok(())
                     }
                 }
@@ -567,13 +593,23 @@ impl<T> UidOnlyAdapter<T> {
                     drop(shared);
                     return Err(self.poison("missing reserved provenance slot"));
                 }
-                let record = match self.active_kind {
+                let record = match self.active_kind.take() {
                     Some(ActiveResponseKind::TranslatedUidFetch { leading_uid }) => {
                         Provenance::TranslatedUidFetch {
                             leading_uid,
                             wire_bytes: self.response_bytes,
                         }
                     }
+                    Some(ActiveResponseKind::TaggedCompletion {
+                        tag,
+                        status,
+                        has_response_code,
+                    }) => Provenance::TaggedCompletion {
+                        tag,
+                        status,
+                        has_response_code,
+                        wire_bytes: self.response_bytes,
+                    },
                     Some(ActiveResponseKind::Unchanged) => Provenance::Unchanged {
                         wire_bytes: self.response_bytes,
                     },
@@ -896,6 +932,67 @@ fn is_enabled_uidonly(line: &[u8]) -> bool {
 enum TaggedStatus {
     Ok,
     NoOrBad,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SafeTaggedStatus {
+    Ok,
+    No,
+    Bad,
+}
+
+impl SafeTaggedStatus {
+    fn from_parsed(status: &Status) -> Option<Self> {
+        match status {
+            Status::Ok => Some(Self::Ok),
+            Status::No => Some(Self::No),
+            Status::Bad => Some(Self::Bad),
+            _ => None,
+        }
+    }
+
+    fn failure_message(self) -> Option<&'static str> {
+        match self {
+            Self::Ok => None,
+            Self::No => Some("UIDONLY command completed with tagged NO"),
+            Self::Bad => Some("UIDONLY command completed with tagged BAD"),
+        }
+    }
+}
+
+struct TaggedCompletion {
+    tag: Vec<u8>,
+    status: SafeTaggedStatus,
+    has_response_code: bool,
+}
+
+fn classify_tagged_completion(line: &[u8]) -> Option<TaggedCompletion> {
+    let line = line.strip_suffix(b"\r\n")?;
+    let space = line.iter().position(|byte| *byte == b' ')?;
+    let tag = &line[..space];
+    if tag.is_empty() || matches!(tag.first(), Some(b'*' | b'+')) {
+        return None;
+    }
+    let rest = &line[space + 1..];
+    let status_end = rest
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(rest.len());
+    let status = match &rest[..status_end] {
+        value if value.eq_ignore_ascii_case(b"OK") => SafeTaggedStatus::Ok,
+        value if value.eq_ignore_ascii_case(b"NO") => SafeTaggedStatus::No,
+        value if value.eq_ignore_ascii_case(b"BAD") => SafeTaggedStatus::Bad,
+        _ => return None,
+    };
+    let has_response_code = rest
+        .get(status_end..)
+        .and_then(|suffix| suffix.strip_prefix(b" "))
+        .is_some_and(|text| text.starts_with(b"["));
+    Some(TaggedCompletion {
+        tag: tag.to_vec(),
+        status,
+        has_response_code,
+    })
 }
 
 fn tagged_status(line: &[u8], expected_tag: &[u8]) -> Option<TaggedStatus> {
@@ -1306,19 +1403,28 @@ where
         let mut command_wire_bytes = 0_usize;
 
         loop {
-            let response = self
-                .session
-                .read_response()
-                .await
-                .map_err(|error| {
-                    io::Error::new(error.kind(), "UIDONLY IMAP response read or parse failed")
-                })?
-                .ok_or_else(|| {
-                    io::Error::new(
+            let response = match self.session.read_response().await {
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "connection closed before command completion",
-                    )
-                })?;
+                    ))
+                }
+                Err(error) => {
+                    if let Some(message) = self
+                        .handle
+                        .take_provenance()
+                        .and_then(|provenance| tagged_parse_failure(&provenance, &request_id))
+                    {
+                        return Err(invalid_data(message));
+                    }
+                    return Err(io::Error::new(
+                        error.kind(),
+                        "UIDONLY IMAP response read or parse failed",
+                    ));
+                }
+            };
             response_count = response_count
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("command response count overflow"))?;
@@ -1342,7 +1448,8 @@ where
                 Response::Done {
                     tag, status, code, ..
                 } => {
-                    require_unchanged(provenance)?;
+                    let wire_has_response_code =
+                        require_tagged_completion(provenance, tag, status)?;
                     if tag != &request_id {
                         return Err(invalid_data("unexpected tagged response"));
                     }
@@ -1353,6 +1460,11 @@ where
                             _ => "UIDONLY command completed with unexpected tagged status",
                         };
                         return Err(invalid_data(failure));
+                    }
+                    if wire_has_response_code != code.is_some() {
+                        return Err(invalid_data(
+                            "tagged response code was not parsed consistently",
+                        ));
                     }
                     match code {
                         Some(ResponseCode::ReadOnly)
@@ -1522,6 +1634,40 @@ fn require_unchanged(provenance: Provenance) -> io::Result<()> {
     } else {
         Err(invalid_data("non-FETCH response has UIDFETCH provenance"))
     }
+}
+
+fn require_tagged_completion(
+    provenance: Provenance,
+    parsed_tag: &RequestId,
+    parsed_status: &Status,
+) -> io::Result<bool> {
+    let Provenance::TaggedCompletion {
+        tag,
+        status,
+        has_response_code,
+        ..
+    } = provenance
+    else {
+        return Err(invalid_data(
+            "tagged response does not have tagged wire provenance",
+        ));
+    };
+    if tag != parsed_tag.as_bytes() {
+        return Err(invalid_data("parsed and wire response tags differ"));
+    }
+    if Some(status) != SafeTaggedStatus::from_parsed(parsed_status) {
+        return Err(invalid_data("parsed and wire tagged statuses differ"));
+    }
+    Ok(has_response_code)
+}
+
+fn tagged_parse_failure(provenance: &Provenance, request_id: &RequestId) -> Option<&'static str> {
+    let Provenance::TaggedCompletion { tag, status, .. } = provenance else {
+        return None;
+    };
+    (tag == request_id.as_bytes())
+        .then(|| status.failure_message())
+        .flatten()
 }
 
 fn push_notification(

@@ -876,8 +876,41 @@ async fn tagged_command_rejections_preserve_only_the_safe_status_class() {
     for (status, expected) in [
         ("NO", "UIDONLY command completed with tagged NO"),
         ("BAD", "UIDONLY command completed with tagged BAD"),
+        (
+            "BAD [UIDREQUIRED]",
+            "UIDONLY command completed with tagged BAD",
+        ),
     ] {
         let response = format!("A0003 {status} private provider detail\r\n");
+        let transcript = fixture_with_after_enable(response.as_bytes());
+        let (session, _, _) = activated_session(
+            transcript,
+            AdapterLimits::default(),
+            CommandLimits::default(),
+        )
+        .await;
+        let error = session
+            .fetch_body_chunk(nz(42), 0, nz(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), expected);
+        assert!(!error.to_string().contains("private provider detail"));
+    }
+}
+
+#[tokio::test]
+async fn unparseable_tagged_status_never_bypasses_tag_or_ok_validation() {
+    for (response, expected) in [
+        (
+            "A9999 BAD [UIDREQUIRED] private provider detail\r\n",
+            "unexpected tagged response",
+        ),
+        (
+            "A0003 OK [UIDREQUIRED] private provider detail\r\n",
+            "tagged response code was not parsed consistently",
+        ),
+    ] {
         let transcript = fixture_with_after_enable(response.as_bytes());
         let (session, _, _) = activated_session(
             transcript,

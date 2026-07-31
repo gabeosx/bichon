@@ -42,6 +42,7 @@ pub struct AccountDownTask {
     tasks: Mutex<Option<HashMap<u64, (TaskHandle, CancellationToken)>>>,
     manual_tasks: Mutex<HashMap<u64, (JoinHandle<()>, CancellationToken)>>,
     busy_accounts: Mutex<HashSet<u64>>,
+    deleting_accounts: Mutex<HashSet<u64>>,
 }
 
 impl AccountDownTask {
@@ -50,6 +51,7 @@ impl AccountDownTask {
             tasks: Mutex::new(Some(HashMap::new())),
             manual_tasks: Mutex::new(HashMap::new()),
             busy_accounts: Mutex::new(HashSet::new()),
+            deleting_accounts: Mutex::new(HashSet::new()),
         }
     }
 
@@ -79,6 +81,18 @@ impl AccountDownTask {
     // }
 
     pub async fn start_download_task(&self, account_id: u64, email: String) {
+        // Keep deletion admission locked through task registration. If
+        // deletion wins first, no new scheduled task can be registered; if
+        // registration wins first, begin_account_deletion waits and then
+        // cancels/joins the registered task.
+        let deleting = self.deleting_accounts.lock().await;
+        if deleting.contains(&account_id) {
+            warn!(
+                "Account {}: scheduled task not started during account deletion.",
+                account_id
+            );
+            return;
+        }
         let task_name = format!("account-download-task-{}-{}", account_id, &email);
         let periodic_task = PeriodicTask::new(&task_name);
 
@@ -167,6 +181,7 @@ impl AccountDownTask {
         };
         let handler = periodic_task.start(task, Some(account_id), TASK_INTERVAL, true, true);
         self.add_task(account_id, (handler, cancel_token)).await;
+        drop(deleting);
     }
 
     pub async fn add_task(&self, account_id: u64, handler: (TaskHandle, CancellationToken)) {
@@ -188,6 +203,20 @@ impl AccountDownTask {
             }
         }
         Ok(())
+    }
+
+    pub async fn begin_account_deletion(&self, account_id: u64) -> BichonResult<()> {
+        {
+            let mut deleting = self.deleting_accounts.lock().await;
+            deleting.insert(account_id);
+        }
+        self.stop(account_id).await?;
+        self.cancel_manual_task(account_id).await;
+        Ok(())
+    }
+
+    pub async fn end_account_deletion(&self, account_id: u64) {
+        self.deleting_accounts.lock().await.remove(&account_id);
     }
 
     pub async fn shutdown(&self) {
@@ -212,6 +241,16 @@ impl AccountDownTask {
     }
 
     pub async fn start_manual_task(&self, account_id: u64) -> BichonResult<()> {
+        // Serialize deletion admission with the complete manual-task
+        // registration. begin_account_deletion either blocks this start or
+        // observes and joins the fully registered task.
+        let deleting = self.deleting_accounts.lock().await;
+        if deleting.contains(&account_id) {
+            return Err(raise_error!(
+                "Account deletion is in progress.".into(),
+                ErrorCode::Forbidden
+            ));
+        }
         {
             if self.is_manual_running(account_id).await {
                 return Err(raise_error!(
@@ -264,6 +303,7 @@ impl AccountDownTask {
             let mut guard = self.manual_tasks.lock().await;
             guard.insert(account_id, (handle, cancel_token));
         }
+        drop(deleting);
 
         Ok(())
     }
@@ -279,5 +319,59 @@ impl AccountDownTask {
     pub async fn is_manual_running(&self, account_id: u64) -> bool {
         let guard = self.manual_tasks.lock().await;
         guard.contains_key(&account_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn account_deletion_blocks_scheduled_and_manual_registration() {
+        let tasks = AccountDownTask::new();
+        tasks.begin_account_deletion(771_001).await.unwrap();
+
+        tasks
+            .start_download_task(771_001, "deleted@example.invalid".into())
+            .await;
+        assert!(tasks
+            .tasks
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .get(&771_001)
+            .is_none());
+
+        let error = tasks.start_manual_task(771_001).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Forbidden);
+        assert!(!tasks.is_manual_running(771_001).await);
+    }
+
+    #[tokio::test]
+    async fn account_deletion_cancels_and_joins_registered_manual_task() {
+        let tasks = AccountDownTask::new();
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = finished.clone();
+        let handle = tokio::spawn(async move {
+            task_token.cancelled().await;
+            task_finished.store(true, Ordering::Release);
+        });
+        tasks
+            .manual_tasks
+            .lock()
+            .await
+            .insert(771_002, (handle, token));
+
+        tasks.begin_account_deletion(771_002).await.unwrap();
+
+        assert!(finished.load(Ordering::Acquire));
+        assert!(!tasks.is_manual_running(771_002).await);
     }
 }

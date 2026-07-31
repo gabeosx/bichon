@@ -21,7 +21,12 @@ use crate::{
     error::BichonResult,
     imap::uidonly_acquisition::cleanup_uidonly_mailbox_state,
     settings::dir::DATA_DIR_MANAGER,
-    store::tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
+    store::tantivy::{
+        attachment::ATTACHMENT_MANAGER,
+        envelope::{
+            ENVELOPE_MANAGER, UIDONLY_ACQUISITION_LIFECYCLE_GATE, UIDONLY_CANONICAL_WRITE_LOCK,
+        },
+    },
 };
 use std::collections::BTreeSet;
 
@@ -37,7 +42,10 @@ pub async fn delete_mailbox_impl(account_id: u64, mailbox_id: u64) -> BichonResu
         .into_iter()
         .filter(|m| m.id == mailbox_id || m.name.starts_with(&prefix))
         .collect();
-    let ids_to_delete: Vec<u64> = mailboxes_to_delete.iter().map(|mailbox| mailbox.id).collect();
+    let ids_to_delete: Vec<u64> = mailboxes_to_delete
+        .iter()
+        .map(|mailbox| mailbox.id)
+        .collect();
 
     if ids_to_delete.is_empty() {
         return Ok(());
@@ -47,6 +55,8 @@ pub async fn delete_mailbox_impl(account_id: u64, mailbox_id: u64) -> BichonResu
         .iter()
         .map(|mailbox| mailbox.name.clone())
         .collect();
+    let _uidonly_lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+    let _uidonly_write_guard = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
     cleanup_uidonly_mailbox_state(
         &DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition"),
         account_id,
@@ -58,7 +68,7 @@ pub async fn delete_mailbox_impl(account_id: u64, mailbox_id: u64) -> BichonResu
     }
 
     ENVELOPE_MANAGER
-        .delete_mailbox_envelopes(account_id, ids_to_delete.clone())
+        .delete_mailbox_envelopes_locked(account_id, ids_to_delete.clone())
         .await?;
     ATTACHMENT_MANAGER
         .delete_mailbox_attachments(account_id, ids_to_delete.clone())

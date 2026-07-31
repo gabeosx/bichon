@@ -11,7 +11,7 @@ use crate::raise_error;
 use crate::store::tantivy::attachment::ATTACHMENT_MANAGER;
 use crate::store::tantivy::envelope::ENVELOPE_MANAGER;
 use crate::store::tantivy::fields::{
-    F_ACCOUNT_ID, F_CONTENT_HASH, F_ID, F_INGEST_AT, F_MAILBOX_ID, F_SHARD_ID, F_UID,
+    F_ACCOUNT_ID, F_CONTENT_HASH, F_ID, F_INGEST_AT, F_MAILBOX_ID, F_SHARD_ID,
 };
 use crate::store::tantivy::schema::SchemaTools;
 
@@ -35,7 +35,7 @@ pub(crate) const UIDONLY_SHARD_ID: u64 = u64::MAX;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum DedupIdentity {
     Legacy,
-    UidOnly(u64),
+    UidOnly(String),
 }
 
 /// Dedup map for one account.
@@ -189,10 +189,6 @@ fn dedup_account(
             .fast_fields()
             .i64(F_INGEST_AT)
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-        let uid_col = segment_reader
-            .fast_fields()
-            .u64(F_UID)
-            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
         let shard_col = segment_reader
             .fast_fields()
             .u64(F_SHARD_ID)
@@ -221,11 +217,6 @@ fn dedup_account(
 
             let mailbox_id = mailbox_col.values.get_val(doc_id);
             let ingest_at = ingest_col.values.get_val(doc_id);
-            let identity = if shard_col.values.get_val(doc_id) == UIDONLY_SHARD_ID {
-                DedupIdentity::UidOnly(uid_col.values.get_val(doc_id))
-            } else {
-                DedupIdentity::Legacy
-            };
 
             // Read content_hash from the dictionary-encoded string column
             let hash_ord = hash_col
@@ -250,6 +241,16 @@ fn dedup_account(
                 .ord_to_str(id_ord, &mut id_buf)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
             let email_id = id_buf;
+            let identity = if shard_col.values.get_val(doc_id) == UIDONLY_SHARD_ID {
+                // UIDONLY envelope IDs encode account, mailbox, UIDVALIDITY,
+                // UID, and raw content hash. Keying by that durable logical
+                // identity prevents a reused UID in a new epoch from being
+                // collapsed while still removing duplicate commits of the
+                // same logical record.
+                DedupIdentity::UidOnly(email_id.clone())
+            } else {
+                DedupIdentity::Legacy
+            };
 
             // eprintln!(
             //     "DEBUG dedup_account: account={account_id} doc_id={doc_id} mailbox={mailbox_id} hash={content_hash:?} id={email_id:?} ingest_at={ingest_at}"
@@ -559,14 +560,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedup_preserves_identical_uidonly_bodies_at_distinct_uids() {
+    async fn dedup_preserves_distinct_uidonly_logical_records_with_identical_bodies() {
         Harness::run(
             "uidonly-distinct-uids",
             |ef, ew, af, aw| {
                 add_email_with_identity(
                     ef,
                     ew,
-                    "uid-10",
+                    "uidonly-epoch-9-uid-10",
                     1,
                     200,
                     "hash-same",
@@ -577,19 +578,19 @@ mod tests {
                 add_email_with_identity(
                     ef,
                     ew,
-                    "uid-20",
+                    "uidonly-epoch-10-uid-10",
                     1,
                     200,
                     "hash-same",
                     2000,
-                    20,
+                    10,
                     UIDONLY_SHARD_ID,
                 );
-                add_attachment(af, aw, "att-10", "uid-10", 1, 200);
-                add_attachment(af, aw, "att-20", "uid-20", 1, 200);
+                add_attachment(af, aw, "att-epoch-9", "uidonly-epoch-9-uid-10", 1, 200);
+                add_attachment(af, aw, "att-epoch-10", "uidonly-epoch-10-uid-10", 1, 200);
             },
-            &["uid-10", "uid-20"],
-            &["att-10", "att-20"],
+            &["uidonly-epoch-9-uid-10", "uidonly-epoch-10-uid-10"],
+            &["att-epoch-9", "att-epoch-10"],
         )
         .await;
     }

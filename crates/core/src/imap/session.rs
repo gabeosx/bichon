@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
+use bichon_uidonly::UidOnlyAdapter;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, BufWriter};
 use tokio_io_timeout::TimeoutStream;
@@ -43,6 +43,7 @@ impl<T: SessionStream> SessionStream for BufWriter<T> {
     //     self.get_mut().set_read_timeout(timeout);
     // }
 }
+impl<T: SessionStream> SessionStream for UidOnlyAdapter<T> {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + std::fmt::Debug> SessionStream
     for Pin<Box<TimeoutStream<T>>>
 {

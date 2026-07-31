@@ -38,15 +38,26 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-type Response = Vec<u8>;
+enum ScriptAction {
+    Respond(Vec<u8>),
+    DisconnectOnce(AtomicBool),
+    RespondThenDisconnectOnce { response: Vec<u8>, used: AtomicBool },
+}
+
+enum MatchedAction<'a> {
+    Respond(&'a [u8]),
+    Disconnect,
+    RespondThenDisconnect(&'a [u8]),
+}
 
 pub struct MockImapServer {
     greeting: Vec<u8>,
-    script: Vec<(String, Response)>,
+    script: Vec<(String, ScriptAction)>,
     transcript: Arc<Mutex<Vec<String>>>,
 }
 
@@ -68,7 +79,35 @@ impl MockImapServer {
     /// Add a script step: when a client command *contains* `pattern` (case-insensitive),
     /// respond with `response`. Steps are checked in insertion order.
     pub fn respond(mut self, pattern: impl Into<String>, response: impl Into<Vec<u8>>) -> Self {
-        self.script.push((pattern.into(), response.into()));
+        self.script
+            .push((pattern.into(), ScriptAction::Respond(response.into())));
+        self
+    }
+
+    /// Close the first connection that sends a matching command. A later
+    /// matching response can be registered with `respond` to exercise retry.
+    pub fn disconnect_once(mut self, pattern: impl Into<String>) -> Self {
+        self.script.push((
+            pattern.into(),
+            ScriptAction::DisconnectOnce(AtomicBool::new(false)),
+        ));
+        self
+    }
+
+    /// Send a partial response and close the first connection that sends a
+    /// matching command. A later `respond` step handles the retry.
+    pub fn respond_then_disconnect_once(
+        mut self,
+        pattern: impl Into<String>,
+        response: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.script.push((
+            pattern.into(),
+            ScriptAction::RespondThenDisconnectOnce {
+                response: response.into(),
+                used: AtomicBool::new(false),
+            },
+        ));
         self
     }
 
@@ -123,10 +162,20 @@ impl MockImapServer {
 
             let tag = extract_tag(&line).unwrap_or("A0");
             let matched = self.find_match(&line);
-            if let Some(response) = matched {
-                let substituted = substitute_tag(response, tag);
-                if writer.write_all(&substituted).await.is_err() {
-                    break;
+            if let Some(action) = matched {
+                match action {
+                    MatchedAction::Respond(response) => {
+                        let substituted = substitute_tag(response, tag);
+                        if writer.write_all(&substituted).await.is_err() {
+                            break;
+                        }
+                    }
+                    MatchedAction::Disconnect => break,
+                    MatchedAction::RespondThenDisconnect(response) => {
+                        let substituted = substitute_tag(response, tag);
+                        let _ = writer.write_all(&substituted).await;
+                        break;
+                    }
                 }
             } else {
                 // Default: send tagged OK for commands we don't handle
@@ -138,11 +187,25 @@ impl MockImapServer {
         }
     }
 
-    fn find_match(&self, line: &str) -> Option<&[u8]> {
+    fn find_match(&self, line: &str) -> Option<MatchedAction<'_>> {
         let line_lower = line.to_lowercase();
-        for (pattern, response) in &self.script {
+        for (pattern, action) in &self.script {
             if line_lower.contains(&pattern.to_lowercase()) {
-                return Some(response);
+                match action {
+                    ScriptAction::Respond(response) => {
+                        return Some(MatchedAction::Respond(response));
+                    }
+                    ScriptAction::DisconnectOnce(used) if !used.swap(true, Ordering::AcqRel) => {
+                        return Some(MatchedAction::Disconnect);
+                    }
+                    ScriptAction::DisconnectOnce(_) => continue,
+                    ScriptAction::RespondThenDisconnectOnce { response, used }
+                        if !used.swap(true, Ordering::AcqRel) =>
+                    {
+                        return Some(MatchedAction::RespondThenDisconnect(response));
+                    }
+                    ScriptAction::RespondThenDisconnectOnce { .. } => continue,
+                }
             }
         }
         None
@@ -203,9 +266,7 @@ fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ============================================================
@@ -239,12 +300,7 @@ pub fn status_response(
 }
 
 /// Build an EXAMINE response with mailbox data.
-pub fn examine_response(
-    _mailbox: &str,
-    exists: u32,
-    uid_validity: u32,
-    uid_next: u32,
-) -> Vec<u8> {
+pub fn examine_response(_mailbox: &str, exists: u32, uid_validity: u32, uid_next: u32) -> Vec<u8> {
     format!(
         "* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)\r\n\
          * OK [PERMANENTFLAGS ()]\r\n\
@@ -374,10 +430,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_scripted_response() {
         let handle = MockImapServer::new()
-            .respond(
-                "LOGIN",
-                "A0 OK LOGIN completed\r\n",
-            )
+            .respond("LOGIN", "A0 OK LOGIN completed\r\n")
             .start()
             .await;
 
@@ -391,7 +444,10 @@ mod tests {
 
         // Send a command that has no scripted response
         let resp = send_and_recv(&handle.host(), handle.port(), "A0 NOOP").await;
-        assert!(resp.contains("OK done"), "unmatched command should get fallback OK");
+        assert!(
+            resp.contains("OK done"),
+            "unmatched command should get fallback OK"
+        );
     }
 
     #[tokio::test]

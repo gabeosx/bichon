@@ -21,18 +21,23 @@ use crate::{
         migration::AccountModel,
         state::{DownloadState, DownloadStatus, FolderStatus},
     },
-    cache::{
-        imap::{
-            download::flow::{fetch_and_save_by_date, fetch_and_save_full_mailbox, FetchDirection},
-            mailbox::MailBox,
+    cache::imap::{
+        download::flow::{
+            acquire_mailbox_permit, fetch_and_save_by_date, fetch_and_save_full_mailbox,
+            persist_live_mailboxes, FetchDirection,
         },
-        SEMAPHORE,
+        mailbox::MailBox,
     },
     error::{code::ErrorCode, BichonResult},
-    imap::uidonly_acquisition::cleanup_uidonly_mailbox_state,
+    imap::uidonly_acquisition::{cleanup_uidonly_mailbox_state, AcquisitionLimits},
     raise_error,
     settings::dir::DATA_DIR_MANAGER,
-    store::tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
+    store::tantivy::{
+        attachment::ATTACHMENT_MANAGER,
+        envelope::{
+            ENVELOPE_MANAGER, UIDONLY_ACQUISITION_LIFECYCLE_GATE, UIDONLY_CANONICAL_WRITE_LOCK,
+        },
+    },
 };
 
 use std::collections::BTreeSet;
@@ -40,21 +45,33 @@ use std::future::Future;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-async fn run_rebuild_sequence<R, Cleanup, DeleteEnvelope, DeleteAttachment, Reacquire>(
+async fn run_rebuild_sequence<
+    R,
+    Guard,
+    Acquire,
+    Cleanup,
+    DeleteEnvelope,
+    DeleteAttachment,
+    Reacquire,
+>(
+    acquire: Acquire,
     cleanup: Cleanup,
     delete_envelope: DeleteEnvelope,
     delete_attachment: DeleteAttachment,
     reacquire: Reacquire,
 ) -> BichonResult<R>
 where
+    Acquire: Future<Output = Guard>,
     Cleanup: Future<Output = BichonResult<()>>,
     DeleteEnvelope: Future<Output = BichonResult<()>>,
     DeleteAttachment: Future<Output = BichonResult<()>>,
     Reacquire: Future<Output = BichonResult<R>>,
 {
+    let guard = acquire.await;
     cleanup.await?;
     delete_envelope.await?;
     delete_attachment.await?;
+    drop(guard);
     reacquire.await
 }
 
@@ -81,41 +98,13 @@ pub async fn rebuild_cache(
             )?;
             break;
         }
-        if mailbox.exists == 0 {
-            info!(
-                "Account {}: Mailbox '{}' on the remote server has no emails. Skipping fetch for this mailbox.",
-                account.id, &mailbox.name
-            );
-            DownloadState::update_folder_progress(
-                account.id,
-                mailbox.name.clone(),
-                0,
-                0,
-                FolderStatus::Success,
-                None,
-            )?;
-            continue;
-        }
+        // A full-mailbox rebuild must still capability-gate and EXAMINE a
+        // folder reported as empty. LIST/STATUS is not the completeness proof.
         let account = account.clone();
         let mailbox = mailbox.clone();
 
-        let _global_permit = match SEMAPHORE.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                error!(
-                    "Failed to acquire global semaphore permit for account {} mailbox '{}': {:#?}",
-                    account.id, &mailbox.name, err
-                );
-                continue;
-            }
-        };
-
         match fetch_and_save_full_mailbox(&account, &mailbox, token.clone()).await {
-            Ok(new_highest_uid) => {
-                let mut updated = mailbox.clone();
-                updated.highest_uid = new_highest_uid;
-                MailBox::batch_upsert(&[updated])?;
-            }
+            Ok(_) => {}
             Err(err) => {
                 has_error = true;
                 tracing::error!("Folder sync task failed: {:#?}", err);
@@ -182,13 +171,20 @@ pub async fn rebuild_cache_by_date(
         let date = date.to_string();
         let direction = direction.clone();
 
-        let _global_permit = match SEMAPHORE.clone().acquire_owned().await {
+        let _global_permit = match acquire_mailbox_permit(
+            &token,
+            AcquisitionLimits::for_account(&account).max_runtime,
+        )
+        .await
+        {
             Ok(permit) => permit,
             Err(err) => {
                 error!(
                     "Failed to acquire global semaphore permit for account {} mailbox '{}': {:#?}",
                     account.id, &mailbox.name, err
                 );
+                has_error = true;
+                last_err = Some(err);
                 continue;
             }
         };
@@ -198,7 +194,7 @@ pub async fn rebuild_cache_by_date(
             Ok(new_highest_uid) => {
                 let mut updated = mailbox.clone();
                 updated.highest_uid = new_highest_uid;
-                MailBox::batch_upsert(&[updated])?;
+                persist_live_mailboxes(vec![updated]).await?;
             }
             Err(err) => {
                 has_error = true;
@@ -230,6 +226,11 @@ pub async fn rebuild_mailbox_cache(
     let names = BTreeSet::from([local_mailbox.name.clone(), remote_mailbox.name.clone()]);
     run_rebuild_sequence(
         async {
+            let lifecycle = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+            let canonical = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
+            (lifecycle, canonical)
+        },
+        async {
             cleanup_uidonly_mailbox_state(
                 &DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition"),
                 account.id,
@@ -237,28 +238,9 @@ pub async fn rebuild_mailbox_cache(
             )?;
             Ok(())
         },
-        ENVELOPE_MANAGER.delete_mailbox_envelopes(account.id, vec![local_mailbox.id]),
+        ENVELOPE_MANAGER.delete_mailbox_envelopes_locked(account.id, vec![local_mailbox.id]),
         ATTACHMENT_MANAGER.delete_mailbox_attachments(account.id, vec![local_mailbox.id]),
-        async {
-            if remote_mailbox.exists == 0 {
-                info!(
-                    "Account {}: Mailbox '{}' has no emails on the remote server. The mailbox is empty, no envelopes to fetch.",
-                    account.id,
-                    &local_mailbox.name
-                );
-                DownloadState::update_folder_progress(
-                    account.id,
-                    remote_mailbox.name.clone(),
-                    0,
-                    0,
-                    FolderStatus::Success,
-                    None,
-                )?;
-                Ok(None)
-            } else {
-                fetch_and_save_full_mailbox(account, remote_mailbox, token).await
-            }
-        },
+        fetch_and_save_full_mailbox(account, remote_mailbox, token),
     )
     .await
 }
@@ -272,7 +254,12 @@ pub async fn rebuild_mailbox_cache_by_date(
     token: CancellationToken,
 ) -> BichonResult<Option<u32>> {
     let names = BTreeSet::from([remote.name.clone()]);
-    run_rebuild_sequence(
+    let new_highest_uid = run_rebuild_sequence(
+        async {
+            let lifecycle = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+            let canonical = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
+            (lifecycle, canonical)
+        },
         async {
             cleanup_uidonly_mailbox_state(
                 &DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition"),
@@ -281,7 +268,7 @@ pub async fn rebuild_mailbox_cache_by_date(
             )?;
             Ok(())
         },
-        ENVELOPE_MANAGER.delete_mailbox_envelopes(account.id, vec![local_mailbox_id]),
+        ENVELOPE_MANAGER.delete_mailbox_envelopes_locked(account.id, vec![local_mailbox_id]),
         ATTACHMENT_MANAGER.delete_mailbox_attachments(account.id, vec![local_mailbox_id]),
         async {
             if remote.exists == 0 {
@@ -304,13 +291,25 @@ pub async fn rebuild_mailbox_cache_by_date(
             }
         },
     )
-    .await
+    .await?;
+    let mut updated = remote.clone();
+    updated.highest_uid = new_highest_uid;
+    persist_live_mailboxes(vec![updated]).await?;
+    Ok(new_highest_uid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    struct RecordingGuard(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for RecordingGuard {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("unlock");
+        }
+    }
 
     #[tokio::test]
     async fn rebuild_sequence_cleans_ledger_before_indexes_then_reacquires() {
@@ -322,8 +321,10 @@ mod tests {
                 Ok::<_, crate::error::BichonError>(())
             }
         };
+        let guard_events = events.clone();
         let reacquire_events = events.clone();
         let result = run_rebuild_sequence(
+            async move { RecordingGuard(guard_events) },
             record("cleanup-ledger"),
             record("delete-envelope-index"),
             record("delete-attachment-index"),
@@ -341,6 +342,7 @@ mod tests {
                 "cleanup-ledger",
                 "delete-envelope-index",
                 "delete-attachment-index",
+                "unlock",
                 "reacquire"
             ]
         );
@@ -356,7 +358,9 @@ mod tests {
                 Ok::<_, crate::error::BichonError>(())
             }
         };
+        let guard_events = events.clone();
         let error = run_rebuild_sequence(
+            async move { RecordingGuard(guard_events) },
             async {
                 Err(raise_error!(
                     "synthetic ledger cleanup failure".into(),
@@ -369,7 +373,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("synthetic ledger cleanup failure"));
-        assert!(events.lock().unwrap().is_empty());
+        assert!(error
+            .to_string()
+            .contains("synthetic ledger cleanup failure"));
+        assert_eq!(*events.lock().unwrap(), ["unlock"]);
     }
 }

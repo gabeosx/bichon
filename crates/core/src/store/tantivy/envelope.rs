@@ -37,7 +37,7 @@ use crate::{
     raise_error,
     settings::dir::DATA_DIR_MANAGER,
     store::{
-        blob::BLOB_MANAGER,
+        blob::{uidonly_exact_raw_blob_key, UidOnlyAttachmentBlobKey, BLOB_MANAGER},
         envelope::Envelope,
         tantivy::{
             attachment::ATTACHMENT_MANAGER,
@@ -75,12 +75,16 @@ use tantivy::{
 };
 use tantivy::{schema::Facet, Searcher};
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, RwLock},
     task::{self, JoinHandle},
 };
 use tracing::{info, warn};
 
 pub static ENVELOPE_MANAGER: LazyLock<IndexManager> = LazyLock::new(IndexManager::new);
+pub(crate) static UIDONLY_ACQUISITION_LIFECYCLE_GATE: LazyLock<RwLock<()>> =
+    LazyLock::new(|| RwLock::new(()));
+pub(crate) static UIDONLY_CANONICAL_WRITE_LOCK: LazyLock<Mutex<()>> =
+    LazyLock::new(|| Mutex::new(()));
 
 pub struct IndexManager {
     index: Arc<Index>,
@@ -444,7 +448,7 @@ impl IndexManager {
         account_id: u64,
         envelope_id: &str,
         email_content_hash: String,
-        attachment_content_hashes: HashSet<String>,
+        attachment_content_hashes: HashSet<UidOnlyAttachmentBlobKey>,
     ) -> BichonResult<()> {
         let mut writer = self.index_writer.lock().await;
         writer
@@ -453,9 +457,9 @@ impl IndexManager {
         writer
             .commit()
             .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
-        self.cleanup_unused_content(
+        self.cleanup_unused_uidonly_content(
             &mut writer,
-            HashSet::from([email_content_hash]),
+            email_content_hash,
             attachment_content_hashes,
         )
     }
@@ -716,7 +720,10 @@ impl IndexManager {
                 }
             }
             if !participant_queries.is_empty() {
-                subqueries.push((Occur::Must, Box::new(BooleanQuery::new(participant_queries))));
+                subqueries.push((
+                    Occur::Must,
+                    Box::new(BooleanQuery::new(participant_queries)),
+                ));
             }
         }
 
@@ -1101,6 +1108,15 @@ impl IndexManager {
     }
 
     pub async fn delete_account_envelopes(&self, account_id: u64) -> BichonResult<()> {
+        let _uidonly_lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+        let _uidonly_write_guard = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
+        self.delete_account_envelopes_locked(account_id).await
+    }
+
+    pub(crate) async fn delete_account_envelopes_locked(
+        &self,
+        account_id: u64,
+    ) -> BichonResult<()> {
         let query = self.account_query(account_id);
         let (eml_content_hashes, attachments_content_hashes) =
             self.collect_content_hashes(query)?;
@@ -1132,6 +1148,17 @@ impl IndexManager {
     }
 
     pub async fn delete_mailbox_envelopes(
+        &self,
+        account_id: u64,
+        mailbox_ids: Vec<u64>,
+    ) -> BichonResult<()> {
+        let _uidonly_lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+        let _uidonly_write_guard = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
+        self.delete_mailbox_envelopes_locked(account_id, mailbox_ids)
+            .await
+    }
+
+    pub(crate) async fn delete_mailbox_envelopes_locked(
         &self,
         account_id: u64,
         mailbox_ids: Vec<u64>,
@@ -1263,6 +1290,11 @@ impl IndexManager {
 
             // If no references found, delete from KV store
             if count == 0 {
+                // UIDONLY stores exact RFC822 bytes in a domain-separated
+                // derived key so legacy detached messages cannot collide with
+                // them. Normal lifecycle deletion reclaims both forms only
+                // after this shared canonical reference count reaches zero.
+                eml.insert(uidonly_exact_raw_blob_key(&content_hash));
                 eml.insert(content_hash);
             }
         }
@@ -1284,7 +1316,59 @@ impl IndexManager {
         BLOB_MANAGER.delete(&eml, &attachments)
     }
 
+    fn cleanup_unused_uidonly_content(
+        &self,
+        writer: &mut IndexWriter,
+        email_content_hash: String,
+        attachment_content_hashes: HashSet<UidOnlyAttachmentBlobKey>,
+    ) -> BichonResult<()> {
+        // UIDONLY projection and rollback hold the canonical write lock. The
+        // typed attachment keys below can only be constructed after validating
+        // the embedded UIDONLY namespace prefix, so this path can never delete
+        // an ordinary legacy attachment hash.
+        fatal_commit(writer);
+        let searcher = self.create_searcher()?;
+        let fields = SchemaTools::email_fields();
+        let email_query = TermQuery::new(
+            Term::from_field_text(fields.f_content_hash, &email_content_hash),
+            IndexRecordOption::Basic,
+        );
+        let mut email = HashSet::new();
+        if searcher
+            .search(&email_query, &Count)
+            .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+            == 0
+        {
+            email.insert(uidonly_exact_raw_blob_key(&email_content_hash));
+        }
+
+        let mut attachments = HashSet::new();
+        for content_hash in attachment_content_hashes {
+            let query = TermQuery::new(
+                Term::from_field_text(fields.f_attachment_content_hash, content_hash.as_ref()),
+                IndexRecordOption::Basic,
+            );
+            if searcher
+                .search(&query, &Count)
+                .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?
+                == 0
+            {
+                attachments.insert(content_hash);
+            }
+        }
+        BLOB_MANAGER.delete(&email, &attachments)
+    }
+
     pub async fn delete_envelopes_multi_account(
+        &self,
+        deletes: HashMap<u64, Vec<String>>,
+    ) -> BichonResult<()> {
+        let _uidonly_lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+        let _uidonly_write_guard = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
+        self.delete_envelopes_multi_account_locked(deletes).await
+    }
+
+    pub(crate) async fn delete_envelopes_multi_account_locked(
         &self,
         deletes: HashMap<u64, Vec<String>>,
     ) -> BichonResult<()> {
@@ -1566,7 +1650,7 @@ impl IndexManager {
                     // blob store, referenced by f_content_hash.
                     if let Some(hash_val) = old_doc.get_first(f.f_content_hash) {
                         if let Some(content_hash) = hash_val.as_str() {
-                            match BLOB_MANAGER.get_email(content_hash) {
+                            match BLOB_MANAGER.get_canonical_email(content_hash) {
                                 Ok(Some(eml_bytes)) => {
                                     if let Some(message) = MessageParser::new().parse(&eml_bytes) {
                                         let text = message
@@ -1578,8 +1662,13 @@ impl IndexManager {
                                                     .map(|cow| extract_text(cow.into_owned()))
                                             })
                                             .unwrap_or_default();
-                                        let body_text =
-                                            text.split_whitespace().collect::<Vec<_>>().join(" ");
+                                        let mut body_text = String::with_capacity(text.len());
+                                        for word in text.split_whitespace() {
+                                            if !body_text.is_empty() {
+                                                body_text.push(' ');
+                                            }
+                                            body_text.push_str(word);
+                                        }
                                         if !body_text.is_empty() {
                                             new_doc.add_text(f.f_body, &body_text);
                                         }
@@ -2469,9 +2558,7 @@ mod tests {
             ]))
         };
 
-        let docs = searcher
-            .search(&query, &DocSetCollector)
-            .unwrap();
+        let docs = searcher.search(&query, &DocSetCollector).unwrap();
 
         let mut ids: Vec<String> = Vec::new();
         for addr in docs {
@@ -2813,9 +2900,7 @@ mod tests {
             writer.commit().unwrap();
         }
 
-        let reader = index
-            .reader()
-            .expect("reader");
+        let reader = index.reader().expect("reader");
         let searcher = reader.searcher();
 
         let query = TermQuery::new(
@@ -2842,19 +2927,13 @@ mod tests {
                 .get_first(f.f_ingest_at)
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let uid = doc
-                .get_first(f.f_uid)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let uid = doc.get_first(f.f_uid).and_then(|v| v.as_u64()).unwrap_or(0);
             results.push((ingest_at, uid));
         }
 
         // Verify primary sort by ingest_at is correct
         for w in results.windows(2) {
-            assert!(
-                w[0].0 <= w[1].0,
-                "ingest_at must be non-decreasing"
-            );
+            assert!(w[0].0 <= w[1].0, "ingest_at must be non-decreasing");
         }
 
         // Verify deterministic: run again, same order
@@ -2891,7 +2970,12 @@ mod tests {
 
         println!("IMAP UID mapping (position → ingest_at, uid):");
         for (pos, (ingest_at, uid)) in results.iter().enumerate() {
-            println!("  UID {} → (ingest_at={}, original_uid={})", pos + 1, ingest_at, uid);
+            println!(
+                "  UID {} → (ingest_at={}, original_uid={})",
+                pos + 1,
+                ingest_at,
+                uid
+            );
         }
     }
 }

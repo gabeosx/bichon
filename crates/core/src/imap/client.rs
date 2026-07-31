@@ -25,9 +25,9 @@ use crate::raise_error;
 use crate::utils::net::establish_tcp_connection_with_timeout;
 use crate::utils::net::establish_tls_connection;
 use crate::utils::tls::establish_tls_stream;
-use async_imap::types::ResponseLimits;
 use async_imap::Client as ImapClient;
 use async_imap::Session as ImapSession;
+use bichon_uidonly::{AdapterHandle, AdapterLimits, UidOnlyAdapter};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::ops::Deref;
@@ -88,6 +88,17 @@ impl Client {
         }
     }
 
+    fn new_with_limits(
+        stream: Box<dyn SessionStream>,
+        limits: AdapterLimits,
+    ) -> BichonResult<Self> {
+        let (stream, _) = UidOnlyAdapter::new(stream, limits)
+            .map_err(|error| raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter))?;
+        Ok(Self {
+            inner: ImapClient::new(Box::new(stream)),
+        })
+    }
+
     pub(crate) async fn login(
         self,
         username: &str,
@@ -121,7 +132,7 @@ impl Client {
         use_proxy: Option<u64>,
         dangerous: bool,
     ) -> BichonResult<Self> {
-        Self::connection_with_limits(domain, encryption, port, use_proxy, dangerous, None).await
+        Self::connection_inner(domain, encryption, port, use_proxy, dangerous, None).await
     }
 
     pub(crate) async fn connection_with_limits(
@@ -130,7 +141,26 @@ impl Client {
         port: u16,
         use_proxy: Option<u64>,
         dangerous: bool,
-        response_limits: Option<ResponseLimits>,
+        response_limits: AdapterLimits,
+    ) -> BichonResult<Self> {
+        Self::connection_inner(
+            domain,
+            encryption,
+            port,
+            use_proxy,
+            dangerous,
+            Some(response_limits),
+        )
+        .await
+    }
+
+    async fn connection_inner(
+        domain: &str,
+        encryption: &Encryption,
+        port: u16,
+        use_proxy: Option<u64>,
+        dangerous: bool,
+        response_limits: Option<AdapterLimits>,
     ) -> BichonResult<Self> {
         let resolved_addr = Self::resolve_to_socket_addr(domain, port)?;
         debug!("Attempting IMAP connection to {domain} ({resolved_addr}).");
@@ -166,7 +196,7 @@ impl Client {
         server_hostname: &str,
         use_proxy: Option<u64>,
         dangerous: bool,
-        response_limits: Option<ResponseLimits>,
+        response_limits: Option<AdapterLimits>,
     ) -> BichonResult<Self> {
         // Establish the TLS connection with the specified parameters
         let tls_stream = establish_tls_connection(
@@ -183,12 +213,10 @@ impl Client {
         // Create a SessionStream trait object for further communication
         let session_stream = Box::new(buffered_stream);
         // Initialize the client with the session stream
-        let mut client = Client::new(session_stream);
-        if let Some(limits) = response_limits {
-            client.set_response_limits(limits).map_err(|error| {
-                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
-            })?;
-        }
+        let mut client = match response_limits {
+            Some(limits) => Client::new_with_limits(session_stream, limits)?,
+            None => Client::new(session_stream),
+        };
         // Read and validate the greeting response
         let _greeting = client
             .read_response()
@@ -208,7 +236,7 @@ impl Client {
     async fn establish_insecure_connection(
         address: SocketAddr,
         use_proxy: Option<u64>,
-        response_limits: Option<ResponseLimits>,
+        response_limits: Option<AdapterLimits>,
     ) -> BichonResult<Self> {
         // Establish the TCP connection without encryption
         let tcp_stream = establish_tcp_connection_with_timeout(address, use_proxy).await?;
@@ -218,12 +246,10 @@ impl Client {
         // Create a SessionStream trait object for further communication
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         // Initialize the client with the session stream
-        let mut client = Client::new(session_stream);
-        if let Some(limits) = response_limits {
-            client.set_response_limits(limits).map_err(|error| {
-                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
-            })?;
-        }
+        let mut client = match response_limits {
+            Some(limits) => Client::new_with_limits(session_stream, limits)?,
+            None => Client::new(session_stream),
+        };
 
         // Read and validate the greeting response
         let _greeting = client
@@ -246,7 +272,7 @@ impl Client {
         server_hostname: &str,
         use_proxy: Option<u64>,
         dangerous: bool,
-        response_limits: Option<ResponseLimits>,
+        response_limits: Option<AdapterLimits>,
     ) -> BichonResult<Self> {
         // Establish the initial TCP connection
         let tcp_stream = establish_tcp_connection_with_timeout(address, use_proxy).await?;
@@ -254,13 +280,46 @@ impl Client {
         // Wrap the TCP stream in a buffered writer for efficient IO
         let buffered_tcp_stream = BufWriter::new(stats_stream);
 
-        // Create a client for communication
-        let mut client = async_imap::Client::new(buffered_tcp_stream);
-        if let Some(limits) = response_limits {
-            client.set_response_limits(limits).map_err(|error| {
-                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
+        if let Some(response_limits) = response_limits {
+            // Bound the greeting and STARTTLS response before the parser, then
+            // install a fresh adapter on the final TLS transport.
+            let (bounded_tcp_stream, _) =
+                UidOnlyAdapter::new(buffered_tcp_stream, response_limits.clone()).map_err(
+                    |error| raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter),
+                )?;
+            let mut client = async_imap::Client::new(bounded_tcp_stream);
+
+            let _greeting = client
+                .read_response()
+                .await
+                .map_err(|e| raise_error!(format!("{:#?}", e), classify_io_error(&e)))?
+                .ok_or_else(|| {
+                    raise_error!(
+                        "Failed to read IMAP greeting — this usually indicates an incorrect encryption setting (SSL vs. STARTTLS). Your current setting is STARTTLS.".into(),
+                        ErrorCode::ImapCommandFailed
+                    )
+                })?;
+            client
+                .run_command_and_check_ok("STARTTLS", None)
+                .await
+                .map_err(|_| {
+                    raise_error!(
+                        "STARTTLS command failed".into(),
+                        ErrorCode::ImapCommandFailed
+                    )
+                })?;
+            let buffered_tcp_stream = client.into_inner().into_inner().map_err(|error| {
+                raise_error!(format!("{error:#?}"), ErrorCode::ImapCommandFailed)
             })?;
+            let tcp_stream = buffered_tcp_stream.into_inner();
+            let tls_stream =
+                establish_tls_stream(server_hostname, &[], tcp_stream, dangerous).await?;
+            let session_stream: Box<dyn SessionStream> = Box::new(BufWriter::new(tls_stream));
+            return Client::new_with_limits(session_stream, response_limits);
         }
+
+        // Preserve the pre-existing STARTTLS transport for ordinary sessions.
+        let mut client = async_imap::Client::new(buffered_tcp_stream);
 
         // Read and validate the greeting response
         let _greeting = client
@@ -295,12 +354,7 @@ impl Client {
         // Create a SessionStream trait object for further communication
         let session_stream: Box<dyn SessionStream> = Box::new(buffered_stream);
         // Initialize the client with the session stream
-        let mut client = Client::new(session_stream);
-        if let Some(limits) = response_limits {
-            client.set_response_limits(limits).map_err(|error| {
-                raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
-            })?;
-        }
+        let client = Client::new(session_stream);
         // Return the established client
         Ok(client)
     }
@@ -327,30 +381,191 @@ impl Client {
     }
 }
 
+/// Acquisition-only client whose final transport is bounded and UIDONLY-aware
+/// before any authenticated IMAP response reaches `async-imap`.
+#[derive(Debug)]
+pub(crate) struct UidOnlyClient {
+    inner: ImapClient<UidOnlyAdapter<Box<dyn SessionStream>>>,
+    handle: AdapterHandle,
+}
+
+impl UidOnlyClient {
+    fn from_final_stream(
+        stream: Box<dyn SessionStream>,
+        limits: AdapterLimits,
+    ) -> BichonResult<Self> {
+        let (stream, handle) = UidOnlyAdapter::new(stream, limits)
+            .map_err(|error| raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter))?;
+        Ok(Self {
+            inner: ImapClient::new(stream),
+            handle,
+        })
+    }
+
+    async fn read_greeting(&mut self, encryption: &str) -> BichonResult<()> {
+        self.inner
+            .read_response()
+            .await
+            .map_err(|error| raise_error!(format!("{error:#?}"), classify_io_error(&error)))?
+            .ok_or_else(|| {
+                raise_error!(
+                    format!("failed to read bounded IMAP greeting for {encryption}"),
+                    ErrorCode::ImapCommandFailed
+                )
+            })?;
+        Ok(())
+    }
+
+    pub(crate) async fn connection(
+        domain: &str,
+        encryption: &Encryption,
+        port: u16,
+        use_proxy: Option<u64>,
+        dangerous: bool,
+        limits: AdapterLimits,
+    ) -> BichonResult<Self> {
+        let address = Client::resolve_to_socket_addr(domain, port)?;
+        debug!("Attempting bounded UIDONLY IMAP connection to {domain} ({address}).");
+        match encryption {
+            Encryption::Ssl => {
+                let tls_stream = establish_tls_connection(
+                    address,
+                    domain,
+                    alpn(address.port()),
+                    use_proxy,
+                    dangerous,
+                )
+                .await?;
+                let stream: Box<dyn SessionStream> =
+                    Box::new(BufWriter::new(StatsWrapper::new(tls_stream)));
+                let mut client = Self::from_final_stream(stream, limits)?;
+                client.read_greeting("SSL").await?;
+                Ok(client)
+            }
+            Encryption::None => {
+                let tcp_stream = establish_tcp_connection_with_timeout(address, use_proxy).await?;
+                let stream: Box<dyn SessionStream> =
+                    Box::new(BufWriter::new(StatsWrapper::new(tcp_stream)));
+                let mut client = Self::from_final_stream(stream, limits)?;
+                client.read_greeting("plaintext").await?;
+                Ok(client)
+            }
+            Encryption::StartTls => {
+                // Bound the pre-TLS greeting and STARTTLS completion, then
+                // install a fresh adapter around the final TLS transport.
+                let tcp_stream = establish_tcp_connection_with_timeout(address, use_proxy).await?;
+                let stream: Box<dyn SessionStream> =
+                    Box::new(BufWriter::new(StatsWrapper::new(tcp_stream)));
+                let (bounded, _) =
+                    UidOnlyAdapter::new(stream, limits.clone()).map_err(|error| {
+                        raise_error!(format!("{error:#?}"), ErrorCode::InvalidParameter)
+                    })?;
+                let mut client = ImapClient::new(bounded);
+                client
+                    .read_response()
+                    .await
+                    .map_err(|error| {
+                        raise_error!(format!("{error:#?}"), classify_io_error(&error))
+                    })?
+                    .ok_or_else(|| {
+                        raise_error!(
+                            "failed to read bounded STARTTLS greeting".into(),
+                            ErrorCode::ImapCommandFailed
+                        )
+                    })?;
+                client
+                    .run_command_and_check_ok("STARTTLS", None)
+                    .await
+                    .map_err(|error| {
+                        raise_error!(format!("{error:#?}"), ErrorCode::ImapCommandFailed)
+                    })?;
+                let stream = client.into_inner().into_inner().map_err(|error| {
+                    raise_error!(format!("{error:#?}"), ErrorCode::ImapCommandFailed)
+                })?;
+                let tls_stream = establish_tls_stream(domain, &[], stream, dangerous).await?;
+                let stream: Box<dyn SessionStream> = Box::new(BufWriter::new(tls_stream));
+                Self::from_final_stream(stream, limits)
+            }
+        }
+    }
+
+    pub(crate) async fn login(
+        self,
+        username: &str,
+        password: &str,
+    ) -> BichonResult<(
+        ImapSession<UidOnlyAdapter<Box<dyn SessionStream>>>,
+        AdapterHandle,
+    )> {
+        let Self { inner, handle } = self;
+        let session = inner
+            .login(username, password)
+            .await
+            .map_err(|(error, _)| {
+                raise_error!(format!("{error:#?}"), ErrorCode::ImapAuthenticationFailed)
+            })?;
+        Ok((session, handle))
+    }
+
+    pub(crate) async fn authenticate(
+        self,
+        authenticator: impl async_imap::Authenticator,
+    ) -> BichonResult<(
+        ImapSession<UidOnlyAdapter<Box<dyn SessionStream>>>,
+        AdapterHandle,
+    )> {
+        let Self { inner, handle } = self;
+        let session =
+            inner
+                .authenticate("XOAUTH2", authenticator)
+                .await
+                .map_err(|(error, _)| {
+                    raise_error!(format!("{error:#?}"), ErrorCode::ImapAuthenticationFailed)
+                })?;
+        Ok((session, handle))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::imap::mock_server::MockImapServer;
+    use std::num::NonZeroUsize;
 
     #[tokio::test]
-    async fn acquisition_limits_apply_before_server_greeting() {
+    async fn acquisition_limits_apply_before_greeting_without_changing_standard_client() {
         let server = MockImapServer::new()
             .greeting(format!("* OK {}\r\n", "x".repeat(128)))
             .start()
             .await;
+        let small_limits = AdapterLimits {
+            max_input_bytes: NonZeroUsize::new(32).unwrap(),
+            max_control_line_bytes: NonZeroUsize::new(32).unwrap(),
+            max_literal_bytes: NonZeroUsize::new(32).unwrap(),
+            max_response_bytes: NonZeroUsize::new(32).unwrap(),
+            provenance_capacity: NonZeroUsize::new(4).unwrap(),
+        };
         let error = Client::connection_with_limits(
             &server.host(),
             &Encryption::None,
             server.port(),
             None,
             false,
-            Some(ResponseLimits::new(32, 32)),
+            small_limits,
         )
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains("ResponseTooLarge")
-                || error.to_string().contains("response")
+            error.to_string().contains("control line") || error.to_string().contains("response")
         );
+        Client::connection(
+            &server.host(),
+            &Encryption::None,
+            server.port(),
+            None,
+            false,
+        )
+        .await
+        .expect("ordinary IMAP connection must retain its pre-UIDONLY behavior");
     }
 }

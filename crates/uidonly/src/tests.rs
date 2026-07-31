@@ -507,7 +507,11 @@ async fn raw_fetch_after_activation_is_rejected() {
     )
     .await;
     let error = session.noop().await.unwrap_err();
-    assert!(error.to_string().contains("raw FETCH"));
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "UIDONLY IMAP response read or parse failed"
+    );
     assert!(handle
         .poison_reason()
         .is_some_and(|reason| reason.contains("raw FETCH")));
@@ -655,6 +659,7 @@ async fn truncated_literal_long_line_and_ambiguous_brace_text_fail_closed() {
                 .to_vec(),
             AdapterLimits::default(),
             "truncated IMAP response",
+            io::ErrorKind::UnexpectedEof,
         ),
         (
             {
@@ -669,20 +674,23 @@ async fn truncated_literal_long_line_and_ambiguous_brace_text_fail_closed() {
                 ..AdapterLimits::default()
             },
             "control line exceeds configured byte limit",
+            io::ErrorKind::InvalidData,
         ),
         (
             b"* ENABLED UIDONLY\r\nA0009 OK ENABLE completed\r\n* OK status {5}\r\nabcde"
                 .to_vec(),
             AdapterLimits::default(),
             "outside an active UIDFETCH",
+            io::ErrorKind::InvalidData,
         ),
     ];
-    for (transcript, limits, expected) in cases {
+    for (transcript, limits, expected, expected_kind) in cases {
         let (io, _) = ScriptedIo::new(transcript);
         let (mut adapter, handle) = UidOnlyAdapter::new(io, limits).unwrap();
         handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
         let error = adapter.read_to_end(&mut Vec::new()).await.unwrap_err();
         assert!(error.to_string().contains(expected));
+        assert_eq!(error.kind(), expected_kind);
     }
 }
 
@@ -738,6 +746,11 @@ async fn inventory_rejects_uid_mismatch_missing_items_and_overfull_page() {
             "exactly UID, RFC822.SIZE, and INTERNALDATE",
         ),
         (
+            b"* 7 UIDFETCH (UID 7 RFC822.SIZE 1 internaldate nil)\r\nA0003 OK FETCH completed\r\n"
+                .as_slice(),
+            "INTERNALDATE NIL",
+        ),
+        (
             b"* 1 UIDFETCH (UID 1 RFC822.SIZE 1 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\")\r\n* 2 UIDFETCH (UID 2 RFC822.SIZE 1 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\")\r\nA0003 OK FETCH completed\r\n"
                 .as_slice(),
             "more results than requested",
@@ -753,7 +766,7 @@ async fn inventory_rejects_uid_mismatch_missing_items_and_overfull_page() {
             "item and VANISHED",
         ),
     ];
-    for (response, expected) in cases {
+    for (response, expected_adapter_invariant) in cases {
         let transcript = fixture_with_after_enable(response);
         let (session, _, _) = activated_session(
             transcript,
@@ -769,7 +782,13 @@ async fn inventory_rejects_uid_mismatch_missing_items_and_overfull_page() {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains(expected));
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let surface = error.to_string();
+        assert!(
+            surface.contains(expected_adapter_invariant)
+                || surface == "UIDONLY IMAP response read or parse failed",
+            "unexpected safe error surface: {surface}"
+        );
     }
 }
 
@@ -849,6 +868,55 @@ async fn exact_body_chunk_returns_literal_and_rejects_adjacent_uid_or_wrong_orig
             .unwrap_err();
         assert!(error.to_string().contains(expected));
     }
+}
+
+#[tokio::test]
+async fn literal_meter_charges_body_octets_before_truncated_command_completion() {
+    let raw = b"received before eof";
+    let transcript = fixture_with_after_enable(
+        format!(
+            "* 42 UIDFETCH (UID 42 RFC822.SIZE {} BODY[]<0> {{{}}}\r\n{})\r\n",
+            raw.len(),
+            raw.len(),
+            String::from_utf8_lossy(raw)
+        )
+        .as_bytes(),
+    );
+    let (session, handle, _) = activated_session(
+        transcript,
+        AdapterLimits::default(),
+        CommandLimits::default(),
+    )
+    .await;
+    let before = handle.literal_bytes_received();
+    let error = session
+        .fetch_body_chunk(nz(42), 0, nz(raw.len() as u32))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(handle.literal_bytes_received() - before, raw.len() as u64);
+}
+
+#[tokio::test]
+async fn parser_failures_do_not_echo_literal_bytes() {
+    let transcript = fixture_with_after_enable(
+        b"* 42 UIDFETCH (UID 42 RFC822.SIZE 6 BODY[]<0> {6}\r\nSECRET BROKEN\r\n",
+    );
+    let (session, _, _) = activated_session(
+        transcript,
+        AdapterLimits::default(),
+        CommandLimits::default(),
+    )
+    .await;
+    let error = session
+        .fetch_body_chunk(nz(42), 0, nz(6))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "UIDONLY IMAP response read or parse failed"
+    );
+    assert!(!error.to_string().contains("SECRET"));
 }
 
 #[tokio::test]

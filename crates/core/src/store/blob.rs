@@ -22,6 +22,7 @@ use crate::{
     envelope::extractor::reattach_eml_content_self_healing,
     error::{code::ErrorCode, BichonResult},
     settings::dir::DATA_DIR_MANAGER,
+    utils::compute_content_hash,
 };
 use bichon_blob::{Codec, Config, Engine};
 use bytes::Bytes;
@@ -37,6 +38,57 @@ use tokio::{
 };
 
 pub static BLOB_MANAGER: LazyLock<BlobManager> = LazyLock::new(BlobManager::new);
+
+const UIDONLY_EXACT_RAW_KEY_PREFIX: [u8; 8] = *b"UIDRAW\x01\0";
+const UIDONLY_ATTACHMENT_KEY_PREFIX: [u8; 8] = *b"UIDATT\x01\0";
+
+fn uidonly_blob_key(domain: &[u8], prefix: [u8; 8], content_hash: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(content_hash.as_bytes());
+    let mut key = *hasher.finalize().as_bytes();
+    // Retain 192 bits of the domain-separated digest while making the
+    // unreleased UIDONLY namespace mechanically distinguishable from legacy
+    // content hashes during destructive cleanup.
+    key[..prefix.len()].copy_from_slice(&prefix);
+    hex::encode(key)
+}
+
+pub(crate) fn uidonly_exact_raw_blob_key(content_hash: &str) -> String {
+    uidonly_blob_key(
+        b"bichon-uidonly-exact-raw-v1",
+        UIDONLY_EXACT_RAW_KEY_PREFIX,
+        content_hash,
+    )
+}
+
+pub(crate) fn uidonly_attachment_blob_key(content_hash: &str) -> String {
+    uidonly_blob_key(
+        b"bichon-uidonly-attachment-v1",
+        UIDONLY_ATTACHMENT_KEY_PREFIX,
+        content_hash,
+    )
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct UidOnlyAttachmentBlobKey(String);
+
+impl UidOnlyAttachmentBlobKey {
+    pub(crate) fn from_storage_key(storage_key: &str) -> Option<Self> {
+        if storage_key.len() != 64 {
+            return None;
+        }
+        let bytes = hex::decode(storage_key).ok()?;
+        (bytes.len() == 32 && bytes.starts_with(&UIDONLY_ATTACHMENT_KEY_PREFIX))
+            .then(|| Self(storage_key.to_string()))
+    }
+}
+
+impl AsRef<str> for UidOnlyAttachmentBlobKey {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 pub struct DetachedEmail {
     pub email: (String, Bytes),
@@ -284,6 +336,19 @@ impl BlobManager {
     }
 
     pub fn get_email(&self, content_hash: &str) -> BichonResult<Option<Bytes>> {
+        self.get(content_hash)
+    }
+
+    pub(crate) fn get_canonical_email(&self, content_hash: &str) -> BichonResult<Option<Bytes>> {
+        if let Some(exact) = self.get(&uidonly_exact_raw_blob_key(content_hash))? {
+            if compute_content_hash(&exact) != content_hash {
+                return Err(raise_error!(
+                    "UIDONLY exact raw blob digest mismatch".into(),
+                    ErrorCode::InternalError
+                ));
+            }
+            return Ok(Some(exact));
+        }
         self.get(content_hash)
     }
 

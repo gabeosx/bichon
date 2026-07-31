@@ -156,6 +156,7 @@ struct SharedState {
     reserved: usize,
     provenance_capacity: usize,
     activation_wire_bytes: usize,
+    literal_bytes_received: u64,
     poison_reason: Option<String>,
     waker: AtomicWaker,
 }
@@ -206,6 +207,17 @@ impl AdapterHandle {
             .lock()
             .expect("adapter mutex poisoned")
             .activation_wire_bytes
+    }
+
+    /// Returns the cumulative literal octets accepted by this adapter.
+    ///
+    /// The counter advances before command completion, so callers can charge
+    /// truncated literals even when the connection closes before tagged OK.
+    pub fn literal_bytes_received(&self) -> u64 {
+        self.shared
+            .lock()
+            .expect("adapter mutex poisoned")
+            .literal_bytes_received
     }
 
     /// Returns whether the exact `ENABLE UIDONLY` activation boundary passed.
@@ -268,6 +280,7 @@ impl<T> UidOnlyAdapter<T> {
             reserved: 0,
             provenance_capacity: limits.provenance_capacity.get(),
             activation_wire_bytes: 0,
+            literal_bytes_received: 0,
             poison_reason: None,
             waker: AtomicWaker::new(),
         }));
@@ -295,12 +308,42 @@ impl<T> UidOnlyAdapter<T> {
         ))
     }
 
+    /// Recovers the wrapped transport only at an empty pass-through boundary.
+    ///
+    /// This is used for STARTTLS: the pre-TLS greeting and command response are
+    /// bounded by one adapter, then a fresh adapter is installed around the
+    /// final TLS transport before authentication and UIDONLY activation.
+    pub fn into_inner(self) -> io::Result<T> {
+        let shared = self.shared.lock().expect("adapter mutex poisoned");
+        if !matches!(shared.mode, Mode::PassThrough)
+            || !shared.provenance.is_empty()
+            || shared.reserved != 0
+            || !self.input.is_empty()
+            || !self.emit.is_empty()
+            || !self.line.is_empty()
+            || self.literal_remaining != 0
+            || self.in_response
+            || self.reserved_provenance
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UIDONLY adapter can only be unwrapped at an empty pass-through boundary",
+            ));
+        }
+        drop(shared);
+        Ok(self.inner)
+    }
+
     fn poison(&mut self, message: impl Into<String>) -> io::Error {
+        self.poison_with_kind(io::ErrorKind::InvalidData, message)
+    }
+
+    fn poison_with_kind(&mut self, kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
         let message = message.into();
         let mut shared = self.shared.lock().expect("adapter mutex poisoned");
         shared.mode = Mode::Poisoned;
         shared.poison_reason = Some(message.clone());
-        invalid_data(message)
+        io::Error::new(kind, message)
     }
 
     fn ensure_response_started(&mut self, cx: &Context<'_>) -> io::Result<bool> {
@@ -346,6 +389,18 @@ impl<T> UidOnlyAdapter<T> {
         Ok(())
     }
 
+    fn add_literal_bytes(&mut self, count: usize) -> io::Result<()> {
+        let count =
+            u64::try_from(count).map_err(|_| self.poison("literal byte count does not fit u64"))?;
+        let mut shared = self.shared.lock().expect("adapter mutex poisoned");
+        let Some(total) = shared.literal_bytes_received.checked_add(count) else {
+            drop(shared);
+            return Err(self.poison("literal byte counter overflow"));
+        };
+        shared.literal_bytes_received = total;
+        Ok(())
+    }
+
     fn handle_complete_line(&mut self) -> io::Result<()> {
         let mut wire_line = std::mem::take(&mut self.line);
         debug_assert!(wire_line.ends_with(b"\r\n"));
@@ -361,6 +416,9 @@ impl<T> UidOnlyAdapter<T> {
             self.active_kind,
             Some(ActiveResponseKind::TranslatedUidFetch { .. })
         );
+        if active_uidfetch && contains_internaldate_nil(line_without_crlf) {
+            return Err(self.poison("UIDFETCH INTERNALDATE NIL is invalid"));
+        }
         let mode = self
             .shared
             .lock()
@@ -568,6 +626,7 @@ impl<T> UidOnlyAdapter<T> {
             }
             let count = self.literal_remaining.min(self.input.len()).min(READ_CHUNK);
             self.add_response_bytes(count)?;
+            self.add_literal_bytes(count)?;
             for _ in 0..count {
                 self.emit
                     .push_back(self.input.pop_front().expect("input length checked"));
@@ -625,7 +684,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for UidOnlyAdapter<T> {
                     return Poll::Pending;
                 }
                 if this.in_response || !this.line.is_empty() || this.literal_remaining > 0 {
-                    return Poll::Ready(Err(this.poison("truncated IMAP response")));
+                    return Poll::Ready(Err(this.poison_with_kind(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated IMAP response",
+                    )));
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -743,6 +805,41 @@ fn parse_literal_len(line: &[u8]) -> io::Result<usize> {
         .map_err(|_| invalid_data("invalid literal marker"))
 }
 
+fn contains_internaldate_nil(line: &[u8]) -> bool {
+    let mut index = 0;
+    let mut saw_internal_date = false;
+    while index < line.len() {
+        if line[index] == b'"' {
+            index += 1;
+            while index < line.len() {
+                match line[index] {
+                    b'\\' if index + 1 < line.len() => index += 2,
+                    b'"' => {
+                        index += 1;
+                        break;
+                    }
+                    _ => index += 1,
+                }
+            }
+            continue;
+        }
+        if !line[index].is_ascii_alphanumeric() && line[index] != b'-' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < line.len() && (line[index].is_ascii_alphanumeric() || line[index] == b'-') {
+            index += 1;
+        }
+        let token = &line[start..index];
+        if saw_internal_date {
+            return token.eq_ignore_ascii_case(b"NIL");
+        }
+        saw_internal_date = token.eq_ignore_ascii_case(b"INTERNALDATE");
+    }
+    false
+}
+
 fn parse_pass_through_literal_len(line: &[u8]) -> io::Result<Option<usize>> {
     let Some(open) = line.iter().rposition(|byte| *byte == b'{') else {
         return Ok(None);
@@ -827,6 +924,23 @@ pub struct InventoryRequest {
 }
 
 impl InventoryRequest {
+    /// Creates one bounded fixed-range request. Production callers normally
+    /// obtain requests from `InventoryPlanner`; restartable acquisition may
+    /// reconstruct the next persisted cursor directly through this validator.
+    pub fn new(start: NonZeroU32, end: NonZeroU32, page_size: NonZeroU32) -> io::Result<Self> {
+        if start > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inventory range is reversed",
+            ));
+        }
+        Ok(Self {
+            start,
+            end,
+            page_size,
+        })
+    }
+
     pub fn start(&self) -> NonZeroU32 {
         self.start
     }
@@ -1042,6 +1156,11 @@ impl<T> UidOnlySession<T>
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
+    /// Returns a cloneable meter that survives a failed consuming command.
+    pub fn literal_byte_meter(&self) -> AdapterHandle {
+        self.handle.clone()
+    }
+
     /// Enables UIDONLY and consumes the ordinary session at the clean boundary.
     pub async fn enable(
         mut session: async_imap::Session<UidOnlyAdapter<T>>,
@@ -1188,8 +1307,16 @@ where
             let response = self
                 .session
                 .read_response()
-                .await?
-                .ok_or_else(|| invalid_data("connection closed before command completion"))?;
+                .await
+                .map_err(|error| {
+                    io::Error::new(error.kind(), "UIDONLY IMAP response read or parse failed")
+                })?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed before command completion",
+                    )
+                })?;
             response_count = response_count
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("command response count overflow"))?;

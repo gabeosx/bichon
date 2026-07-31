@@ -17,21 +17,48 @@ built_image=0
 cleanup() {
     status=$?
     trap - EXIT
+    cleanup_failed=0
 
     if docker container inspect "$container" >/dev/null 2>&1; then
         if [ "$status" -ne 0 ]; then
             docker logs --tail 80 "$container" >&2 || true
         fi
         if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" = "true" ]; then
-            docker stop -t 20 "$container" >/dev/null || true
+            docker stop -t 20 "$container" >/dev/null || cleanup_failed=1
         fi
-        docker rm "$container" >/dev/null 2>&1 || true
+        docker rm "$container" >/dev/null 2>&1 || cleanup_failed=1
     fi
-    docker volume rm "$state_volume" "$spool_volume" >/dev/null 2>&1 || true
+    docker volume rm "$state_volume" "$spool_volume" >/dev/null 2>&1 || cleanup_failed=1
     if [ "$built_image" -eq 1 ] && [ "${BICHON_CYRUS_KEEP_IMAGE:-0}" != "1" ]; then
-        docker image rm "$image" >/dev/null 2>&1 || true
+        docker image rm "$image" >/dev/null 2>&1 || cleanup_failed=1
     fi
     rm -rf "$work_root"
+
+    if docker container inspect "$container" >/dev/null 2>&1; then
+        echo "Cyrus cleanup left container $container" >&2
+        cleanup_failed=1
+    fi
+    if docker volume inspect "$state_volume" >/dev/null 2>&1; then
+        echo "Cyrus cleanup left volume $state_volume" >&2
+        cleanup_failed=1
+    fi
+    if docker volume inspect "$spool_volume" >/dev/null 2>&1; then
+        echo "Cyrus cleanup left volume $spool_volume" >&2
+        cleanup_failed=1
+    fi
+    if [ "$built_image" -eq 1 ] \
+        && [ "${BICHON_CYRUS_KEEP_IMAGE:-0}" != "1" ] \
+        && docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Cyrus cleanup left image $image" >&2
+        cleanup_failed=1
+    fi
+    if [ -e "$work_root" ]; then
+        echo "Cyrus cleanup left temporary directory $work_root" >&2
+        cleanup_failed=1
+    fi
+    if [ "$cleanup_failed" -ne 0 ] && [ "$status" -eq 0 ]; then
+        status=1
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -129,6 +156,7 @@ echo "Running Bichon UIDONLY Cyrus interoperability test..."
     cd "$repo_root"
     BICHON_CYRUS_PORT="$port" \
     BICHON_CYRUS_ARCHIVE_ROOT="$work_root/archive" \
+    BICHON_ROOT_DIR="$work_root/bichon-root" \
         "$cargo_bin" test -p bichon-core --lib --no-default-features --locked \
         imap::uidonly_acquisition::tests::cyrus_uidonly_exact_raw_roundtrip \
         -- --ignored --exact --test-threads=1

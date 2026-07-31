@@ -25,7 +25,10 @@ use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
 use crate::imap::executor::ImapExecutor;
 use crate::message::content::AttachmentInfo;
-use crate::store::blob::{DetachedEmail, BLOB_MANAGER};
+use crate::store::blob::{
+    uidonly_attachment_blob_key, uidonly_exact_raw_blob_key, DetachedEmail,
+    UidOnlyAttachmentBlobKey, BLOB_MANAGER,
+};
 use crate::store::tantivy::attachment::ATTACHMENT_MANAGER;
 use crate::store::tantivy::dedup::UIDONLY_SHARD_ID;
 use crate::store::tantivy::dedup_cache::DEDUP_CACHE;
@@ -38,11 +41,11 @@ use crate::{raise_error, utc_now};
 use async_imap::types::Fetch;
 use bytes::Bytes;
 use mail_parser::{Address, HeaderName, Message, MessageParser, MimeHeaders};
-use tantivy::TantivyDocument;
 use tantivy::schema::Facet;
+use tantivy::TantivyDocument;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use uuid::Uuid;
-use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +62,7 @@ pub(crate) fn fail_uidonly_after_attachments(enabled: bool) {
 pub(crate) struct CanonicalProjection {
     pub envelope_id: String,
     pub content_hash: String,
+    pub created: bool,
 }
 
 pub async fn extract_envelope_and_store_it(
@@ -151,7 +155,7 @@ pub(crate) async fn project_uidonly_message(
     mailbox_id: u64,
     envelope_id: String,
     shutdown: CancellationToken,
-) -> BichonResult<CanonicalProjection> {
+) -> BichonResult<Option<CanonicalProjection>> {
     extract_envelope_core(
         body,
         uid,
@@ -164,13 +168,7 @@ pub(crate) async fn project_uidonly_message(
         Some(envelope_id),
         Some(&shutdown),
     )
-    .await?
-    .ok_or_else(|| {
-        raise_error!(
-            format!("UID {uid} was not projected into the canonical archive"),
-            ErrorCode::InternalError
-        )
-    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,17 +191,34 @@ async fn extract_envelope_core(
         //println!("Duplicate email detected");
         return Ok(None);
     }
-    let message: Message<'_> = MessageParser::new().parse(body).ok_or_else(|| {
-        raise_error!(
+    let Some(message): Option<Message<'_>> = MessageParser::new().parse(body) else {
+        if durable {
+            return project_unparseable_uidonly(
+                body,
+                uid,
+                size,
+                internal_date,
+                account_id,
+                mailbox_id,
+                fixed_envelope_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                shutdown,
+            )
+            .await;
+        }
+        return Err(raise_error!(
             "Email header parse result is not available".into(),
             ErrorCode::InternalError
-        )
-    })?;
+        ));
+    };
 
     if let Ok(account) = AccountModel::get(account_id) {
         if let Some(ref rules) = account.archive_rules {
             let sender = message.from().and_then(|addr| {
-                AddrVec::from(addr).0.into_iter().next().and_then(|a| a.address)
+                AddrVec::from(addr)
+                    .0
+                    .into_iter()
+                    .next()
+                    .and_then(|a| a.address)
             });
             let subject = message.subject().map(|s| s.to_string());
 
@@ -237,13 +252,12 @@ async fn extract_envelope_core(
         String::new()
     };
 
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    let preview = if text.chars().count() > preview_limit {
-        text.chars().take(preview_limit).collect::<String>() + "..."
-    } else {
-        text.clone()
-    };
+    let text = normalize_whitespace(&text, durable.then_some(16 * 1024 * 1024));
+    let mut preview_chars = text.chars();
+    let mut preview: String = preview_chars.by_ref().take(preview_limit).collect();
+    if preview_chars.next().is_some() {
+        preview.push_str("...");
+    }
 
     let body_text = text;
 
@@ -289,13 +303,22 @@ async fn extract_envelope_core(
         .and_then(|add| add.address)
         .unwrap_or_else(|| "unknown".to_string());
     let attachment_count = message.attachment_count();
-    let (attachments, detached_email) =
-        prepare_detached_attachments(body, &message, &email_content_hash, account_id, mailbox_id)
-            .await;
+    let (attachments, detached_email) = prepare_detached_attachments(
+        body,
+        &message,
+        &email_content_hash,
+        account_id,
+        mailbox_id,
+        // External document extractors do not expose an enforceable allocator
+        // budget. UIDONLY therefore skips optional attachment text/OCR during
+        // acquisition; raw attachments and their metadata remain canonical.
+        // This keeps the explicit projection memory ceiling meaningful.
+        durable.then_some(0),
+    )
+    .await?;
     check_uidonly_projection_cancelled(shutdown)?;
     let envelope_id = fixed_envelope_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = utc_now!();
-
 
     let mut final_tags = Vec::new();
 
@@ -304,11 +327,7 @@ async fn extract_envelope_core(
             if let Some(tags) = bmd.tags {
                 let validated_tags: Result<Vec<String>, _> = tags
                     .iter()
-                    .map(|tag| {
-                        Facet::from_text(tag)
-                            .map(|_| tag.clone()) 
-                            .map_err(|e| e)
-                    })
+                    .map(|tag| Facet::from_text(tag).map(|_| tag.clone()).map_err(|e| e))
                     .collect();
 
                 match validated_tags {
@@ -316,10 +335,7 @@ async fn extract_envelope_core(
                         final_tags = valid_list;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Tag validation failed, ignoring all tags: {:#?}",
-                            e
-                        );
+                        eprintln!("Tag validation failed, ignoring all tags: {:#?}", e);
                     }
                 }
             }
@@ -392,10 +408,7 @@ async fn extract_envelope_core(
         envelope,
         attachments: Some(attachments),
     };
-    let doc = ea.to_document(
-        &body_text,
-        if durable { UIDONLY_SHARD_ID } else { 0 },
-    )?;
+    let doc = ea.to_document(&body_text, if durable { UIDONLY_SHARD_ID } else { 0 })?;
     tracing::debug!(
         "[account {}][mailbox {}] extract: uid={} msg_id={} content_hash={}",
         account_id,
@@ -442,12 +455,104 @@ async fn extract_envelope_core(
     Ok(Some(CanonicalProjection {
         envelope_id,
         content_hash: email_content_hash,
+        created: true,
     }))
 }
 
-fn check_uidonly_projection_cancelled(
+fn normalize_whitespace(input: &str, max_output_bytes: Option<usize>) -> String {
+    let ceiling = max_output_bytes.unwrap_or(usize::MAX);
+    let mut output = String::with_capacity(input.len().min(ceiling));
+    for word in input.split_whitespace() {
+        let separator = usize::from(!output.is_empty());
+        if output
+            .len()
+            .checked_add(separator)
+            .and_then(|len| len.checked_add(word.len()))
+            .is_none_or(|len| len > ceiling)
+        {
+            break;
+        }
+        if separator == 1 {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn project_unparseable_uidonly(
+    body: &[u8],
+    uid: u32,
+    size: u32,
+    internal_date: i64,
+    account_id: u64,
+    mailbox_id: u64,
+    envelope_id: String,
     shutdown: Option<&CancellationToken>,
-) -> BichonResult<()> {
+) -> BichonResult<Option<CanonicalProjection>> {
+    check_uidonly_projection_cancelled(shutdown)?;
+    let content_hash = compute_content_hash(body);
+    let envelope = Envelope {
+        id: envelope_id.clone(),
+        message_id: generate_message_id(),
+        account_id,
+        mailbox_id,
+        uid,
+        subject: String::new(),
+        preview: String::new(),
+        from: "unknown".into(),
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        date: 0,
+        internal_date,
+        ingest_at: utc_now!(),
+        size,
+        thread_id: hex_hash(&format!(
+            "uidonly-unparseable-{account_id}-{mailbox_id}-{uid}"
+        )),
+        attachment_count: 0,
+        regular_attachment_count: 0,
+        tags: None,
+        account_email: None,
+        mailbox_name: None,
+        content_hash: content_hash.clone(),
+        account_name: None,
+    };
+    let doc = EnvelopeWithAttachments {
+        envelope,
+        attachments: Some(Vec::new()),
+    }
+    .to_document("", UIDONLY_SHARD_ID)?;
+    BLOB_MANAGER
+        .store_durable(DetachedEmail {
+            email: (
+                uidonly_exact_raw_blob_key(&content_hash),
+                Bytes::copy_from_slice(body),
+            ),
+            attachments: Some(Vec::new()),
+        })
+        .await?;
+    let commit_result = async {
+        check_uidonly_projection_cancelled(shutdown)?;
+        ENVELOPE_MANAGER.commit_document(doc).await?;
+        check_uidonly_projection_cancelled(shutdown)
+    }
+    .await;
+    if let Err(error) = commit_result {
+        rollback_failed_uidonly_projection(account_id, &envelope_id, &content_hash, &[]).await?;
+        return Err(error);
+    }
+    DEDUP_CACHE.insert(account_id, mailbox_id, &content_hash);
+    Ok(Some(CanonicalProjection {
+        envelope_id,
+        content_hash,
+        created: true,
+    }))
+}
+
+fn check_uidonly_projection_cancelled(shutdown: Option<&CancellationToken>) -> BichonResult<()> {
     if shutdown.is_some_and(CancellationToken::is_cancelled) {
         Err(raise_error!(
             "UIDONLY canonical projection cancelled".into(),
@@ -464,16 +569,29 @@ async fn rollback_failed_uidonly_projection(
     email_content_hash: &str,
     attachments: &[AttachmentInfo],
 ) -> BichonResult<()> {
-    let mut attachment_hashes: std::collections::HashSet<String> = attachments
+    let mut attachment_hashes: std::collections::HashSet<UidOnlyAttachmentBlobKey> = attachments
         .iter()
-        .map(|attachment| attachment.content_hash.clone())
+        .filter_map(|attachment| {
+            let key = UidOnlyAttachmentBlobKey::from_storage_key(&attachment.content_hash);
+            if key.is_none() {
+                tracing::warn!(
+                    envelope_id,
+                    "refusing to delete a non-UIDONLY attachment key during projection rollback"
+                );
+            }
+            key
+        })
         .collect();
     let mut cleanup_errors = Vec::new();
     match ATTACHMENT_MANAGER
         .rollback_documents(account_id, envelope_id)
         .await
     {
-        Ok(indexed_hashes) => attachment_hashes.extend(indexed_hashes),
+        Ok(indexed_hashes) => attachment_hashes.extend(
+            indexed_hashes
+                .iter()
+                .filter_map(|hash| UidOnlyAttachmentBlobKey::from_storage_key(hash)),
+        ),
         Err(error) => cleanup_errors.push(error.to_string()),
     }
     if let Err(error) = ENVELOPE_MANAGER
@@ -491,7 +609,10 @@ async fn rollback_failed_uidonly_projection(
         Ok(())
     } else {
         Err(raise_error!(
-            format!("UIDONLY canonical rollback failed: {}", cleanup_errors.join("; ")),
+            format!(
+                "UIDONLY canonical rollback failed: {}",
+                cleanup_errors.join("; ")
+            ),
             ErrorCode::InternalError
         ))
     }
@@ -504,12 +625,25 @@ pub(crate) async fn rollback_uidonly_message(
     raw: Option<&[u8]>,
 ) -> BichonResult<()> {
     let mut cleanup_errors = Vec::new();
-    let mut attachment_hashes: std::collections::HashSet<String> = raw
-        .and_then(|body| MessageParser::new().parse(body))
-        .map(|message| {
+    let mut attachment_hashes: std::collections::HashSet<UidOnlyAttachmentBlobKey> = raw
+        .and_then(|body| {
+            MessageParser::new()
+                .parse(body)
+                .map(|message| (body, message))
+        })
+        .map(|(body, message)| {
             message
                 .attachments()
-                .map(|attachment| compute_content_hash(attachment.contents()))
+                .map(|attachment| {
+                    let storage_key = uidonly_attachment_storage_hash(
+                        body,
+                        attachment.raw_body_offset() as usize,
+                        attachment.raw_end_offset() as usize,
+                        attachment.contents(),
+                    );
+                    UidOnlyAttachmentBlobKey::from_storage_key(&storage_key)
+                        .expect("UIDONLY attachment derivation must produce a namespaced key")
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -517,7 +651,11 @@ pub(crate) async fn rollback_uidonly_message(
         .rollback_documents(account_id, envelope_id)
         .await
     {
-        Ok(hashes) => attachment_hashes.extend(hashes),
+        Ok(hashes) => attachment_hashes.extend(
+            hashes
+                .iter()
+                .filter_map(|hash| UidOnlyAttachmentBlobKey::from_storage_key(hash)),
+        ),
         Err(error) => {
             cleanup_errors.push(error.to_string());
         }
@@ -537,7 +675,10 @@ pub(crate) async fn rollback_uidonly_message(
         Ok(())
     } else {
         Err(raise_error!(
-            format!("UIDONLY canonical rollback failed: {}", cleanup_errors.join("; ")),
+            format!(
+                "UIDONLY canonical rollback failed: {}",
+                cleanup_errors.join("; ")
+            ),
             ErrorCode::InternalError
         ))
     }
@@ -649,13 +790,14 @@ pub fn extract_references(message: &Message<'_>) -> Option<Vec<String>> {
     }
 }
 
-async fn prepare_detached_attachments(
+pub(crate) async fn prepare_detached_attachments(
     original_body: &[u8],
     message: &Message<'_>,
     eml_content_hash: &str,
     account_id: u64,
     mailbox_id: u64,
-) -> (Vec<AttachmentInfo>, DetachedEmail) {
+    extraction_budget: Option<usize>,
+) -> BichonResult<(Vec<AttachmentInfo>, DetachedEmail)> {
     let rules = if account_id > 0 {
         AccountModel::get(account_id)
             .ok()
@@ -674,7 +816,12 @@ async fn prepare_detached_attachments(
         .and_then(|addr| AddrVec::from(addr).0.into_iter().next())
         .and_then(|add| add.address);
 
-    let mut stripped_eml = original_body.to_vec();
+    let exact_raw = extraction_budget.is_some();
+    let mut stripped_eml = if exact_raw {
+        Vec::new()
+    } else {
+        original_body.to_vec()
+    };
     let mut attachment_infos = Vec::new();
     // Step 1: Collect and sort attachment ranges in reverse to maintain offset integrity
     let mut ranges: Vec<_> = message
@@ -699,6 +846,8 @@ async fn prepare_detached_attachments(
         bytes: Vec<u8>,
     }
     let mut text_candidates: Vec<TextCandidate> = Vec::new();
+    let mut attachment_copy_bytes = 0usize;
+    let mut extraction_input_bytes = 0usize;
 
     for (raw_start, raw_end, att) in ranges {
         // mail-parser may report attachment offsets past the body end for
@@ -708,23 +857,58 @@ async fn prepare_detached_attachments(
         let raw_end = raw_end.min(body_len);
         let range_valid = raw_start < raw_end;
 
-        // content hash is computed from the decoded attachment contents,
-        // which is always available regardless of raw offset validity.
-        let content_hash = compute_content_hash(att.contents());
+        // Legacy storage keys decoded attachment content. UIDONLY stores the
+        // exact encoded MIME slice and therefore keys that exact slice. Two
+        // legal encodings of the same decoded bytes must not alias, otherwise
+        // deduplication can substitute the wrong wire representation and make
+        // exact RFC822 readback impossible.
+        let content_hash = if extraction_budget.is_some() {
+            uidonly_attachment_storage_hash(
+                original_body,
+                att.raw_body_offset() as usize,
+                att.raw_end_offset() as usize,
+                att.contents(),
+            )
+        } else {
+            compute_content_hash(att.contents())
+        };
 
         if range_valid {
             let raw_bytes = &original_body[raw_start..raw_end];
+            attachment_copy_bytes = attachment_copy_bytes
+                .checked_add(raw_bytes.len())
+                .ok_or_else(|| {
+                    raise_error!(
+                        "attachment working-set size overflow".into(),
+                        ErrorCode::PayloadTooLarge
+                    )
+                })?;
+            if extraction_budget.is_some() && attachment_copy_bytes > original_body.len() {
+                return Err(raise_error!(
+                    "overlapping MIME attachment ranges exceed the UIDONLY memory ceiling".into(),
+                    ErrorCode::PayloadTooLarge
+                ));
+            }
             // The actual content stored in the blob is the raw undecoded data.
             attachments.push((content_hash.clone(), Bytes::copy_from_slice(raw_bytes)));
 
             // Replace raw attachment content with a hash-based placeholder
-            let placeholder = format!("<<BICHON_DETACH_HASH:{}>>", &content_hash);
-            stripped_eml.splice(raw_start..raw_end, placeholder.as_bytes().iter().cloned());
+            if !exact_raw {
+                let placeholder = format!("<<BICHON_DETACH_HASH:{}>>", &content_hash);
+                stripped_eml.splice(raw_start..raw_end, placeholder.as_bytes().iter().cloned());
+            }
         } else {
-            // Invalid range: store a zero-length blob so the consistency
-            // check passes; reattachment will log a warning for the missing
-            // blob data but won't panic.
-            attachments.push((content_hash.clone(), Bytes::new()));
+            // Invalid ranges cannot be sliced. UIDONLY still retains the
+            // complete raw message independently and stores the decoded
+            // attachment bytes under their matching fallback digest so
+            // attachment readback remains verifiable. Keep the legacy
+            // zero-length behavior unchanged.
+            let bytes = if exact_raw {
+                Bytes::copy_from_slice(att.contents())
+            } else {
+                Bytes::new()
+            };
+            attachments.push((content_hash.clone(), bytes));
         }
 
         let inline = att
@@ -765,9 +949,16 @@ async fn prepare_detached_attachments(
         if !inline || !has_cid {
             let decoded_len = att.contents().len();
             if should_extract
+                && extraction_budget != Some(0)
                 && decoded_len <= crate::ext::text_extractor::MAX_EXTRACT_BYTES
                 && crate::ext::text_extractor::should_try_extract(&file_type, &ext)
+                && extraction_budget.is_none_or(|budget| {
+                    extraction_input_bytes
+                        .checked_add(decoded_len)
+                        .is_some_and(|total| total <= budget)
+                })
             {
+                extraction_input_bytes += decoded_len;
                 text_candidates.push(TextCandidate {
                     content_hash: content_hash.clone(),
                     file_type: file_type.clone(),
@@ -796,15 +987,21 @@ async fn prepare_detached_attachments(
     // Run text extraction in a single spawn_blocking batch.
     if !text_candidates.is_empty() {
         if let Ok(mut extracted_map) = tokio::task::spawn_blocking(move || {
-            let mut map: std::collections::HashMap<
-                String,
-                (String, Option<u32>, bool),
-            > = std::collections::HashMap::new();
+            let mut map: std::collections::HashMap<String, (String, Option<u32>, bool)> =
+                std::collections::HashMap::new();
+            let mut extracted_bytes = 0usize;
             for c in text_candidates {
                 if let Some(r) =
                     crate::ext::text_extractor::extract_text(&c.file_type, &c.ext, &c.bytes)
                 {
-                    map.insert(c.content_hash, (r.text, r.page_count, r.is_ocr));
+                    if extraction_budget.is_none_or(|budget| {
+                        extracted_bytes
+                            .checked_add(r.text.len())
+                            .is_some_and(|total| total <= budget)
+                    }) {
+                        extracted_bytes += r.text.len();
+                        map.insert(c.content_hash, (r.text, r.page_count, r.is_ocr));
+                    }
                 }
             }
             map
@@ -820,13 +1017,54 @@ async fn prepare_detached_attachments(
             }
         }
     }
-    (
+    if extraction_budget.is_some()
+        && stripped_eml.len() > original_body.len().saturating_add(32 * 1024 * 1024)
+    {
+        return Err(raise_error!(
+            "detached UIDONLY message exceeds the projection memory ceiling".into(),
+            ErrorCode::PayloadTooLarge
+        ));
+    }
+    Ok((
         attachment_infos,
         DetachedEmail {
-            email: (eml_content_hash.to_string(), Bytes::from(stripped_eml)),
+            // UIDONLY keeps the complete original message under its content
+            // hash. Detached attachment blobs remain available for canonical
+            // attachment APIs, while exact-message readback never depends on
+            // ambiguous placeholder substitution. The legacy path retains
+            // its existing detached representation.
+            email: (
+                if exact_raw {
+                    uidonly_exact_raw_blob_key(eml_content_hash)
+                } else {
+                    eml_content_hash.to_string()
+                },
+                if exact_raw {
+                    Bytes::copy_from_slice(original_body)
+                } else {
+                    Bytes::from(stripped_eml)
+                },
+            ),
             attachments: Some(attachments),
         },
-    )
+    ))
+}
+
+fn uidonly_attachment_storage_hash(
+    original_body: &[u8],
+    raw_start: usize,
+    raw_end: usize,
+    decoded: &[u8],
+) -> String {
+    let content_hash = if raw_start < raw_end && raw_end <= original_body.len() {
+        compute_content_hash(&original_body[raw_start..raw_end])
+    } else {
+        // Malformed offsets are not safe to slice. The complete UIDONLY raw
+        // message is still retained independently, so this fallback cannot
+        // compromise exact RFC822 readback.
+        compute_content_hash(decoded)
+    };
+    uidonly_attachment_blob_key(&content_hash)
 }
 
 pub async fn detach_and_store_attachments(
@@ -842,8 +1080,10 @@ pub async fn detach_and_store_attachments(
         eml_content_hash,
         account_id,
         mailbox_id,
+        None,
     )
-    .await;
+    .await
+    .expect("legacy attachment preparation remains infallible without UIDONLY budgets");
     BLOB_MANAGER.queue(detached_email).await;
     attachment_infos
 }
@@ -853,8 +1093,7 @@ pub fn reattach_eml_content(
     envelope_id: String,
 ) -> BichonResult<(Envelope, Bytes)> {
     let e = ENVELOPE_MANAGER
-        .get_envelope_by_id(account_id, &envelope_id)
-        ?
+        .get_envelope_by_id(account_id, &envelope_id)?
         .ok_or_else(|| {
             raise_error!(
                 format!(
@@ -866,7 +1105,7 @@ pub fn reattach_eml_content(
         })?;
 
     let restored_eml = BLOB_MANAGER
-        .get_email(&e.envelope.content_hash)?
+        .get_canonical_email(&e.envelope.content_hash)?
         .ok_or_else(|| {
             raise_error!(
                 format!(
@@ -876,6 +1115,10 @@ pub fn reattach_eml_content(
                 ErrorCode::ResourceNotFound
             )
         })?;
+
+    if compute_content_hash(&restored_eml) == e.envelope.content_hash {
+        return Ok((e.envelope, restored_eml));
+    }
 
     if !e.envelope.has_any_attachments() {
         return Ok((e.envelope, restored_eml));
@@ -908,11 +1151,7 @@ pub fn reattach_eml_content(
             let absolute_start = search_cursor + pos;
             let absolute_end = absolute_start + pattern_len;
 
-            tasks.push((
-                absolute_start,
-                absolute_end,
-                detail.content_hash.clone(),
-            ));
+            tasks.push((absolute_start, absolute_end, detail.content_hash.clone()));
             search_cursor = absolute_end;
         }
     }
@@ -956,7 +1195,10 @@ pub async fn reattach_eml_content_self_healing(
         .envelope;
 
     // Fast path: the content blob is present, reuse the regular reattach logic.
-    if BLOB_MANAGER.get_email(&envelope.content_hash)?.is_some() {
+    if BLOB_MANAGER
+        .get_canonical_email(&envelope.content_hash)?
+        .is_some()
+    {
         return reattach_eml_content(account_id, envelope_id);
     }
 
@@ -992,8 +1234,8 @@ pub async fn reattach_eml_content_self_healing(
 /// the archived `content_hash` (the server-side message no longer matches what
 /// Bichon archived, so it cannot be treated as a recovery of that blob).
 async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
-    let mailbox = MailBox::find_mailbox(envelope.account_id, envelope.mailbox_id)?
-        .ok_or_else(|| {
+    let mailbox =
+        MailBox::find_mailbox(envelope.account_id, envelope.mailbox_id)?.ok_or_else(|| {
             raise_error!(
                 format!(
                     "Mailbox not found: account_id={} mailbox_id={}",
@@ -1027,20 +1269,33 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
     // Re-create the detached blob (stripped EML + attachments) so the missing
     // blob is repopulated for future requests. The detached EML is queued under
     // `fetched_hash`, which equals `envelope.content_hash`.
-    let message = MessageParser::new().parse(raw_body.as_slice()).ok_or_else(|| {
-        raise_error!(
-            "Failed to parse fetched email content".into(),
-            ErrorCode::InternalError
-        )
-    })?;
-    detach_and_store_attachments(&raw_body, &message, &fetched_hash, envelope.account_id, envelope.mailbox_id).await;
+    let message = MessageParser::new()
+        .parse(raw_body.as_slice())
+        .ok_or_else(|| {
+            raise_error!(
+                "Failed to parse fetched email content".into(),
+                ErrorCode::InternalError
+            )
+        })?;
+    detach_and_store_attachments(
+        &raw_body,
+        &message,
+        &fetched_hash,
+        envelope.account_id,
+        envelope.mailbox_id,
+    )
+    .await;
 
     Ok(Bytes::from(raw_body))
 }
 
 #[cfg(test)]
 mod test {
+    use super::prepare_detached_attachments;
+    use crate::store::blob::UidOnlyAttachmentBlobKey;
+    use crate::utils::compute_content_hash;
     use html2text::config;
+    use mail_parser::MessageParser;
 
     #[test]
     fn test_various_html_with_overflow_enabled() {
@@ -1126,17 +1381,81 @@ mod test {
         assert!(truncated.len() < raw.len());
 
         // Must not panic.
-        let infos = super::detach_and_store_attachments(
-            truncated,
-            &message,
-            "test_content_hash",
-            0,
-            0,
-        )
-        .await;
+        let infos =
+            super::detach_and_store_attachments(truncated, &message, "test_content_hash", 0, 0)
+                .await;
 
         // The attachment count must still match so the consistency check
         // in reattach_eml_content doesn't fail later.
         assert_eq!(infos.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn uidonly_attachment_keys_preserve_distinct_wire_encodings() {
+        fn fixture(encoding: &str, payload: &str) -> Vec<u8> {
+            format!(
+                "From: sender@example.invalid\r\n\
+                 To: archive@example.invalid\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: multipart/mixed; boundary=b\r\n\
+                 \r\n\
+                 --b\r\n\
+                 Content-Type: text/plain\r\n\
+                 \r\n\
+                 body\r\n\
+                 --b\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=a.bin\r\n\
+                 Content-Transfer-Encoding: {encoding}\r\n\
+                 \r\n\
+                 {payload}\r\n\
+                 --b--\r\n"
+            )
+            .into_bytes()
+        }
+
+        let base64 = fixture("base64", "YWJj");
+        let quoted_printable = fixture("quoted-printable", "abc");
+        let base64_message = MessageParser::new().parse(&base64).unwrap();
+        let quoted_message = MessageParser::new().parse(&quoted_printable).unwrap();
+        assert_eq!(
+            base64_message.attachments().next().unwrap().contents(),
+            quoted_message.attachments().next().unwrap().contents()
+        );
+
+        let (base64_info, base64_detached) = prepare_detached_attachments(
+            &base64,
+            &base64_message,
+            &compute_content_hash(&base64),
+            0,
+            0,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        let (quoted_info, quoted_detached) = prepare_detached_attachments(
+            &quoted_printable,
+            &quoted_message,
+            &compute_content_hash(&quoted_printable),
+            0,
+            0,
+            Some(0),
+        )
+        .await
+        .unwrap();
+        assert_ne!(base64_info[0].content_hash, quoted_info[0].content_hash);
+        assert!(UidOnlyAttachmentBlobKey::from_storage_key(&base64_info[0].content_hash).is_some());
+        assert!(UidOnlyAttachmentBlobKey::from_storage_key(&quoted_info[0].content_hash).is_some());
+        assert!(
+            UidOnlyAttachmentBlobKey::from_storage_key(&compute_content_hash(b"abc")).is_none(),
+            "ordinary legacy attachment hashes must be rejected by UIDONLY orphan cleanup"
+        );
+        assert_eq!(base64_detached.email.1.as_ref(), base64);
+        assert_eq!(quoted_detached.email.1.as_ref(), quoted_printable);
+        assert_ne!(base64_detached.email.0, compute_content_hash(&base64));
+        assert_ne!(
+            quoted_detached.email.0,
+            compute_content_hash(&quoted_printable)
+        );
     }
 }

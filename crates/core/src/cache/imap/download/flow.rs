@@ -35,27 +35,51 @@ use crate::{
         imap::executor::{
             compress_uid_list, generate_uid_sequence_hashset, ImapExecutor, DEFAULT_BATCH_SIZE,
         },
-        imap::manager::{AcquisitionConnection, ImapConnectionManager},
-        imap::uidonly_acquisition::{
-            acquire_bichon_mailbox, AcquisitionLimits, AcquisitionReport,
+        imap::manager::{
+            acquisition_connection_identity, AcquisitionConnection, ImapConnectionManager,
         },
+        imap::uidonly_acquisition::{acquire_bichon_mailbox, AcquisitionLimits, AcquisitionReport},
         settings::dir::DATA_DIR_MANAGER,
-        store::tantivy::envelope::ENVELOPE_MANAGER,
+        store::tantivy::envelope::{ENVELOPE_MANAGER, UIDONLY_ACQUISITION_LIFECYCLE_GATE},
     },
 };
+use bichon_uidonly::UidOnlySession;
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const MAX_NETWORK_RETRIES: u32 = 3;
 
+pub(super) async fn acquire_mailbox_permit(
+    token: &CancellationToken,
+    timeout: Duration,
+) -> BichonResult<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        _ = token.cancelled() => Err(raise_error!(
+            "mailbox acquisition cancelled while waiting for a concurrency permit".into(),
+            ErrorCode::InternalError
+        )),
+        _ = tokio::time::sleep(timeout) => Err(raise_error!(
+            "mailbox acquisition runtime ceiling exceeded while waiting for a concurrency permit".into(),
+            ErrorCode::RequestTimeout
+        )),
+        result = SEMAPHORE.clone().acquire_owned() => result.map_err(|error| raise_error!(
+            format!("failed to acquire mailbox sync concurrency permit: {error}"),
+            ErrorCode::InternalError
+        )),
+    }
+}
+
 async fn build_bounded_acquisition(
-    account_id: u64,
+    account: &AccountModel,
     limits: AcquisitionLimits,
     token: &CancellationToken,
 ) -> BichonResult<(AcquisitionConnection, AcquisitionLimits)> {
     let started = Instant::now();
-    let response_limits = limits.response_limits()?;
+    let adapter_limits = limits.adapter_limits()?;
+    let command_limits = limits.command_limits()?;
+    let expected_identity = acquisition_connection_identity(account)?;
     let connection = tokio::select! {
         _ = token.cancelled() => return Err(raise_error!(
             "UIDONLY acquisition cancelled while connecting".into(),
@@ -63,7 +87,12 @@ async fn build_bounded_acquisition(
         )),
         result = tokio::time::timeout(
             limits.max_runtime,
-            ImapConnectionManager::build_acquisition(account_id, response_limits),
+            ImapConnectionManager::build_acquisition_at_endpoint(
+                account.id,
+                Some(&expected_identity),
+                adapter_limits,
+                command_limits,
+            ),
         ) => result.map_err(|_| raise_error!(
             "UIDONLY acquisition runtime ceiling exceeded while connecting".into(),
             ErrorCode::RequestTimeout
@@ -90,11 +119,36 @@ async fn build_bounded_acquisition(
 async fn acquire_and_validate_uidonly(
     account: &AccountModel,
     mailbox: &MailBox,
-    session: async_imap::Session<Box<dyn crate::imap::session::SessionStream>>,
-    message_limit: Option<u32>,
+    session: UidOnlySession<Box<dyn crate::imap::session::SessionStream>>,
+    message_limit: Option<NonZeroU32>,
     limits: AcquisitionLimits,
     token: CancellationToken,
 ) -> BichonResult<AcquisitionReport> {
+    // Lifecycle cleanup owns the write side before touching acquisition state,
+    // canonical data, or mailbox metadata. Admission is revalidated after the
+    // read side is acquired so a plan queued before deletion fails closed.
+    let _lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.read().await;
+    let current_account = AccountModel::get(account.id)?;
+    if current_account.deleting {
+        return Err(raise_error!(
+            format!(
+                "account {} entered lifecycle deletion before UIDONLY acquisition",
+                account.id
+            ),
+            ErrorCode::Forbidden
+        ));
+    }
+    let current_mailbox = MailBox::get(mailbox.id)?;
+    if current_mailbox.account_id != account.id || current_mailbox.name != mailbox.name {
+        return Err(raise_error!(
+            format!(
+                "mailbox {} changed or was replaced before UIDONLY acquisition",
+                mailbox.id
+            ),
+            ErrorCode::Incompatible
+        ));
+    }
+
     let root = DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition");
     let report = acquire_bichon_mailbox(
         account,
@@ -106,6 +160,16 @@ async fn acquire_and_validate_uidonly(
         token,
     )
     .await?;
+    let detail = if report.success && (report.filtered > 0 || report.vanished > 0) {
+        Some(format!(
+            "UIDONLY snapshot reconciled: {} archived, {} filtered, {} vanished",
+            report.processed, report.filtered, report.vanished
+        ))
+    } else if !report.success {
+        Some("UIDONLY snapshot contains unresolved UIDs; checkpoint was not advanced".to_string())
+    } else {
+        None
+    };
     DownloadState::update_folder_progress(
         account.id,
         mailbox.name.clone(),
@@ -116,9 +180,7 @@ async fn acquire_and_validate_uidonly(
         } else {
             FolderStatus::Failed
         },
-        (!report.success).then(|| {
-            "UIDONLY snapshot contains unresolved UIDs; checkpoint was not advanced".to_string()
-        }),
+        detail,
     )?;
     if !report.success {
         return Err(raise_error!(
@@ -126,9 +188,45 @@ async fn acquire_and_validate_uidonly(
             ErrorCode::ImapUnexpectedResult
         ));
     }
+    let mut updated = mailbox.clone();
+    updated.uid_validity = Some(report.uid_validity);
+    updated.highest_uid = report.checkpoint;
+    MailBox::batch_upsert(&[updated])?;
     Ok(report)
 }
 
+pub(super) async fn persist_live_mailboxes(mailboxes: Vec<MailBox>) -> BichonResult<()> {
+    if mailboxes.is_empty() {
+        return Ok(());
+    }
+    let _lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.read().await;
+    let mut live = Vec::with_capacity(mailboxes.len());
+    for mailbox in mailboxes {
+        if AccountModel::find(mailbox.account_id)?.is_none_or(|account| account.deleting) {
+            warn!(
+                account_id = mailbox.account_id,
+                mailbox_id = mailbox.id,
+                "skipping stale post-acquisition mailbox metadata for a deleted account"
+            );
+            continue;
+        }
+        match MailBox::find_mailbox(mailbox.account_id, mailbox.id)? {
+            Some(current) if current.name == mailbox.name => live.push(mailbox),
+            Some(_) => warn!(
+                mailbox_id = mailbox.id,
+                "skipping stale post-acquisition mailbox metadata for a replaced mailbox"
+            ),
+            None => warn!(
+                mailbox_id = mailbox.id,
+                "skipping stale post-acquisition mailbox metadata for a deleted mailbox"
+            ),
+        }
+    }
+    if !live.is_empty() {
+        MailBox::batch_upsert(&live)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FetchDirection {
@@ -269,9 +367,7 @@ pub async fn fetch_and_save_by_date(
             .await
             {
                 Ok(processed) => break Ok(processed),
-                Err(e)
-                    if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError =>
-                {
+                Err(e) if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError => {
                     retries += 1;
                     warn!(
                         account_id,
@@ -285,22 +381,13 @@ pub async fn fetch_and_save_by_date(
                     match ImapExecutor::create_connection(account_id).await {
                         Ok(new_session) => {
                             session = new_session;
-                            if let Err(e2) = session.examine(&mailbox.encoded_name()).await
-                            {
-                                let err_msg = format!(
-                                    "Re-examine failed after reconnect: {:#?}",
-                                    e2
-                                );
-                                DownloadState::append_session_error(
-                                    account_id,
-                                    err_msg,
-                                )?;
+                            if let Err(e2) = session.examine(&mailbox.encoded_name()).await {
+                                let err_msg =
+                                    format!("Re-examine failed after reconnect: {:#?}", e2);
+                                DownloadState::append_session_error(account_id, err_msg)?;
                                 break Err(e);
                             }
-                            tokio::time::sleep(Duration::from_secs(
-                                1 << (retries - 1),
-                            ))
-                            .await;
+                            tokio::time::sleep(Duration::from_secs(1 << (retries - 1))).await;
                             continue;
                         }
                         Err(e2) => {
@@ -351,6 +438,9 @@ pub async fn fetch_and_save_by_date(
         )?;
     }
     session.logout().await.ok();
+    let mut updated = mailbox.clone();
+    updated.highest_uid = max_uid;
+    persist_live_mailboxes(vec![updated]).await?;
     Ok(max_uid)
 }
 
@@ -364,8 +454,19 @@ pub async fn fetch_and_save_full_mailbox(
     let mailbox_id = mailbox.id;
     let account_id = account.id;
 
-    let limits = AcquisitionLimits::for_account(account);
-    let connection = build_bounded_acquisition(account_id, limits, &token).await;
+    let mut limits = AcquisitionLimits::for_account(account);
+    let permit_started = Instant::now();
+    let _global_permit = acquire_mailbox_permit(&token, limits.max_runtime).await?;
+    limits.max_runtime = limits
+        .max_runtime
+        .checked_sub(permit_started.elapsed())
+        .ok_or_else(|| {
+            raise_error!(
+                "UIDONLY acquisition runtime ceiling exceeded before connecting".into(),
+                ErrorCode::RequestTimeout
+            )
+        })?;
+    let connection = build_bounded_acquisition(account, limits, &token).await;
     let mut session = match connection {
         Ok((AcquisitionConnection::Standard(session), _)) => session,
         Ok((
@@ -378,16 +479,12 @@ pub async fn fetch_and_save_full_mailbox(
             let report = acquire_and_validate_uidonly(
                 account,
                 mailbox,
-                session,
+                *session,
                 message_limit,
                 remaining_limits,
                 token,
             )
             .await?;
-            let mut updated = mailbox.clone();
-            updated.uid_validity = Some(report.uid_validity);
-            updated.highest_uid = report.checkpoint;
-            MailBox::batch_upsert(&[updated])?;
             return Ok(report.checkpoint);
         }
         Err(e) => {
@@ -475,9 +572,7 @@ pub async fn fetch_and_save_full_mailbox(
             .await
             {
                 Ok(count) => break Ok(count),
-                Err(e)
-                    if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError =>
-                {
+                Err(e) if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError => {
                     retries += 1;
                     warn!(
                         account_id,
@@ -492,10 +587,8 @@ pub async fn fetch_and_save_full_mailbox(
                         Ok(new_session) => {
                             session = new_session;
                             if let Err(e2) = session.examine(&mailbox.encoded_name()).await {
-                                let err_msg = format!(
-                                    "Re-examine failed after reconnect: {:#?}",
-                                    e2
-                                );
+                                let err_msg =
+                                    format!("Re-examine failed after reconnect: {:#?}", e2);
                                 DownloadState::append_session_error(account_id, err_msg)?;
                                 break Err(e);
                             }
@@ -551,6 +644,9 @@ pub async fn fetch_and_save_full_mailbox(
         )?;
     }
     session.logout().await.ok();
+    let mut updated = mailbox.clone();
+    updated.highest_uid = max_uid;
+    persist_live_mailboxes(vec![updated]).await?;
     Ok(max_uid)
 }
 
@@ -616,15 +712,13 @@ where
             Ok(None) => {
                 warn!(
                     attempt = attempt + 1,
-                    max_retries,
-                    "STATUS returned no UIDVALIDITY"
+                    max_retries, "STATUS returned no UIDVALIDITY"
                 );
             }
             Err(e) => {
                 warn!(
                     attempt = attempt + 1,
-                    max_retries,
-                    "UIDVALIDITY fetch attempt failed: {:#?}", e
+                    max_retries, "UIDVALIDITY fetch attempt failed: {:#?}", e
                 );
             }
         }
@@ -760,9 +854,7 @@ async fn reconcile_uid_validity_change(
             .await
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
 
-        let batch_size = account
-            .download_batch_size
-            .unwrap_or(DEFAULT_BATCH_SIZE) as usize;
+        let batch_size = account.download_batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as usize;
         let batches = generate_uid_sequence_hashset(missing_uids, batch_size);
 
         let mut downloaded = 0u64;
@@ -859,6 +951,71 @@ pub async fn reconcile_mailboxes(
                 break;
             }
 
+            // Probe the live acquisition capabilities before applying legacy
+            // UIDVALIDITY logic. UIDONLY owns the complete fixed snapshot,
+            // including a missing or changed UIDVALIDITY, and therefore never
+            // falls through to Message-ID reconciliation or synthetic epochs.
+            let mut standard_acquisition_session = None;
+            if account.date_since.is_none() && account.date_before.is_none() {
+                let limits = AcquisitionLimits::for_account(account);
+                let (connection, remaining_limits) =
+                    build_bounded_acquisition(account, limits, &token).await?;
+                match connection {
+                    AcquisitionConnection::UidOnly {
+                        session,
+                        message_limit,
+                    } => {
+                        let permit_started = Instant::now();
+                        let _global_permit = tokio::select! {
+                            _ = token.cancelled() => return Err(raise_error!(
+                                "UIDONLY acquisition cancelled while waiting for a concurrency permit".into(),
+                                ErrorCode::InternalError
+                            )),
+                            _ = tokio::time::sleep(remaining_limits.max_runtime) => {
+                                return Err(raise_error!(
+                                    "UIDONLY acquisition runtime ceiling exceeded while waiting for a concurrency permit".into(),
+                                    ErrorCode::RequestTimeout
+                                ));
+                            }
+                            result = SEMAPHORE.clone().acquire_owned() => result.map_err(|error| {
+                                raise_error!(
+                                    format!(
+                                        "failed to acquire UIDONLY sync concurrency permit: {error:#?}"
+                                    ),
+                                    ErrorCode::InternalError
+                                )
+                            })?,
+                        };
+                        let acquisition_runtime = remaining_limits
+                            .max_runtime
+                            .checked_sub(permit_started.elapsed())
+                            .ok_or_else(|| {
+                                raise_error!(
+                                    "UIDONLY acquisition runtime ceiling exceeded before mailbox acquisition".into(),
+                                    ErrorCode::RequestTimeout
+                                )
+                            })?;
+                        let remaining_limits = AcquisitionLimits {
+                            max_runtime: acquisition_runtime,
+                            ..remaining_limits
+                        };
+                        acquire_and_validate_uidonly(
+                            account,
+                            remote_mailbox,
+                            *session,
+                            message_limit,
+                            remaining_limits,
+                            token.clone(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    AcquisitionConnection::Standard(session) => {
+                        standard_acquisition_session = Some(session);
+                    }
+                }
+            }
+
             // Handle missing UIDVALIDITY from non-compliant IMAP servers
             // (e.g., Tencent Enterprise Mail, etc.)
             let remote_uid_validity = match remote_mailbox.uid_validity {
@@ -915,6 +1072,9 @@ pub async fn reconcile_mailboxes(
                 remote_uid_validity,
             ) {
                 UidValiditySyncStrategy::ReconcileByMessageId => {
+                    if let Some(mut session) = standard_acquisition_session.take() {
+                        session.logout().await.ok();
+                    }
                     info!(
                         "Account {}: Mailbox '{}' detected with changed uid_validity (local: {:#?}, remote: {:#?}). \
                         Comparing by Message-ID to find missing emails.",
@@ -935,6 +1095,7 @@ pub async fn reconcile_mailboxes(
                         local_mailbox,
                         remote_mailbox,
                         token.clone(),
+                        standard_acquisition_session.take(),
                     )
                     .await?
                 }
@@ -950,7 +1111,7 @@ pub async fn reconcile_mailboxes(
         }
         //The metadata of this mailbox must only be updated after a successful synchronization;
         //otherwise, it may cause synchronization errors and result in missing emails in the local sync results.
-        MailBox::batch_upsert(&mailboxes_to_update)?;
+        persist_live_mailboxes(mailboxes_to_update).await?;
     }
 
     debug!(
@@ -975,23 +1136,21 @@ pub async fn reconcile_mailboxes(
                 )?;
                 break;
             }
-            if mailbox.exists > 0 {
+            // Full-mailbox acquisition must traverse the capability gate even
+            // when LIST/STATUS says the folder is empty. The authoritative
+            // UIDONLY EXAMINE snapshot is what proves a complete zero-message
+            // folder and prevents limited providers from bypassing ENABLE.
+            {
                 let account = account.clone();
                 let mailbox = mailbox.clone();
 
-                let _global_permit = match SEMAPHORE.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(err) => {
-                        error!(
-                            "Failed to acquire global semaphore permit for account {} mailbox '{}': {:#?}",
-                            account.id, &mailbox.name, err
-                        );
-                        continue;
-                    }
-                };
-
                 let result = match &account.date_since {
                     Some(date_since) => {
+                        let _global_permit = acquire_mailbox_permit(
+                            &token,
+                            AcquisitionLimits::for_account(&account).max_runtime,
+                        )
+                        .await?;
                         rebuild_mailbox_cache_by_date(
                             &account,
                             mailbox.id,
@@ -1004,6 +1163,11 @@ pub async fn reconcile_mailboxes(
                     }
                     None => match &account.date_before {
                         Some(r) => {
+                            let _global_permit = acquire_mailbox_permit(
+                                &token,
+                                AcquisitionLimits::for_account(&account).max_runtime,
+                            )
+                            .await?;
                             rebuild_mailbox_cache_by_date(
                                 &account,
                                 mailbox.id,
@@ -1021,11 +1185,7 @@ pub async fn reconcile_mailboxes(
                 };
 
                 match result {
-                    Ok(new_highest_uid) => {
-                        let mut updated = mailbox.clone();
-                        updated.highest_uid = new_highest_uid;
-                        MailBox::batch_upsert(&[updated])?;
-                    }
+                    Ok(_) => {}
                     Err(err) => {
                         has_error = true;
                         tracing::error!("Folder sync task failed: {:#?}", err);
@@ -1056,6 +1216,9 @@ async fn perform_incremental_sync(
     local_mailbox: &MailBox,
     remote_mailbox: &MailBox,
     token: CancellationToken,
+    standard_acquisition_session: Option<
+        async_imap::Session<Box<dyn crate::imap::session::SessionStream>>,
+    >,
 ) -> BichonResult<Option<u32>> {
     if remote_mailbox.exists > 0 {
         // Use stored highest_uid if available; otherwise fall back to Tantivy
@@ -1072,8 +1235,7 @@ async fn perform_incremental_sync(
                 uid as u64 + 1
             }
             None => {
-                let local_max_uid =
-                    ENVELOPE_MANAGER.get_max_uid(account.id, local_mailbox.id)?;
+                let local_max_uid = ENVELOPE_MANAGER.get_max_uid(account.id, local_mailbox.id)?;
                 tracing::info!(
                     "[account {}][mailbox {}] perform_incremental_sync: highest_uid unset, Tantivy max_uid={:?}, remote.exists={}",
                     account.id,
@@ -1111,10 +1273,8 @@ async fn perform_incremental_sync(
                                     .await?
                                 }
                                 None => {
-                                    fetch_and_save_full_mailbox(
-                                        account, remote_mailbox, token,
-                                    )
-                                    .await?
+                                    fetch_and_save_full_mailbox(account, remote_mailbox, token)
+                                        .await?
                                 }
                             },
                         };
@@ -1144,26 +1304,9 @@ async fn perform_incremental_sync(
             return Ok(new_max_uid.or(local_mailbox.highest_uid));
         }
 
-        let limits = AcquisitionLimits::for_account(account);
-        let (connection, remaining_limits) =
-            build_bounded_acquisition(account.id, limits, &token).await?;
-        let mut session = match connection {
-            AcquisitionConnection::Standard(session) => session,
-            AcquisitionConnection::UidOnly {
-                session,
-                message_limit,
-            } => {
-                let report = acquire_and_validate_uidonly(
-                    account,
-                    remote_mailbox,
-                    session,
-                    message_limit,
-                    remaining_limits,
-                    token,
-                )
-                .await?;
-                return Ok(report.checkpoint);
-            }
+        let mut session = match standard_acquisition_session {
+            Some(session) => session,
+            None => ImapExecutor::create_connection(account.id).await?,
         };
         let before_date = account
             .date_before
@@ -1185,6 +1328,9 @@ async fn perform_incremental_sync(
         // Keep existing highest_uid if no new mail was fetched.
         Ok(new_max_uid.or(local_mailbox.highest_uid))
     } else {
+        if let Some(mut session) = standard_acquisition_session {
+            session.logout().await.ok();
+        }
         Ok(local_mailbox.highest_uid)
     }
 }
@@ -1211,7 +1357,10 @@ mod tests {
     fn test_generate_synthetic_uidvalidity_different_mailboxes() {
         let inbox = generate_synthetic_uidvalidity("INBOX");
         let sent = generate_synthetic_uidvalidity("Sent");
-        assert_ne!(inbox, sent, "different mailboxes should have different uid_validity");
+        assert_ne!(
+            inbox, sent,
+            "different mailboxes should have different uid_validity"
+        );
     }
 
     #[test]
@@ -1263,10 +1412,8 @@ mod tests {
 
         // Ensure a rustls crypto provider is installed (ring).
         // May already be installed by production code; ignore duplicate.
-        rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
-        )
-        .ok();
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .ok();
 
         let tcp = TcpStream::connect((host, port))
             .await
@@ -1277,8 +1424,8 @@ mod tests {
         let timeout_stream = TimeoutStream::new(tcp);
         let pinned = Box::pin(timeout_stream);
 
-        let server_name = ServerName::try_from(host.to_owned())
-            .map_err(|e| format!("Invalid hostname: {e}"))?;
+        let server_name =
+            ServerName::try_from(host.to_owned()).map_err(|e| format!("Invalid hostname: {e}"))?;
 
         let config = ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore {
@@ -1401,11 +1548,7 @@ mod tests {
 
             session.logout().await.ok();
 
-            println!(
-                "Call {}: UIDVALIDITY = {:?}",
-                i + 1,
-                status.uid_validity
-            );
+            println!("Call {}: UIDVALIDITY = {:?}", i + 1, status.uid_validity);
             results.borrow_mut().push(status.uid_validity);
         }
 
@@ -1468,13 +1611,10 @@ mod tests {
         let sample: Vec<u32> = all_uids.into_iter().take(5).collect();
         let uid_set = compress_uid_list(sample.clone());
 
-        let result = ImapExecutor::fetch_uid_metadata(
-            &mut session,
-            &uid_set,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("fetch_uid_metadata should succeed");
+        let result =
+            ImapExecutor::fetch_uid_metadata(&mut session, &uid_set, CancellationToken::new())
+                .await
+                .expect("fetch_uid_metadata should succeed");
 
         session.logout().await.ok();
 
@@ -1522,8 +1662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_first_attempt_succeeds() {
-        let result = fetch_uid_validity_with_retry_inner(3, mock_results(vec![Ok(Some(42))]))
-            .await;
+        let result = fetch_uid_validity_with_retry_inner(3, mock_results(vec![Ok(Some(42))])).await;
         assert_eq!(result.unwrap(), Some(42));
     }
 
@@ -1585,13 +1724,7 @@ mod tests {
         // max_retries=5, success on 5th attempt
         let result = fetch_uid_validity_with_retry_inner(
             5,
-            mock_results(vec![
-                Ok(None),
-                Ok(None),
-                Ok(None),
-                Ok(None),
-                Ok(Some(5)),
-            ]),
+            mock_results(vec![Ok(None), Ok(None), Ok(None), Ok(None), Ok(Some(5))]),
         )
         .await;
         assert_eq!(result.unwrap(), Some(5));
@@ -1611,11 +1744,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_max_retries_zero() {
         // max_retries=0 means no attempts at all
-        let result = fetch_uid_validity_with_retry_inner(
-            0,
-            mock_results(vec![Ok(Some(42))]),
-        )
-        .await;
+        let result = fetch_uid_validity_with_retry_inner(0, mock_results(vec![Ok(Some(42))])).await;
         assert_eq!(result.unwrap(), None);
     }
 
@@ -1624,8 +1753,8 @@ mod tests {
     // ============================================================
 
     use crate::imap::mock_server::{
-        examine_response, uid_fetch_metadata_response, uid_fetch_rfc822_response,
-        minimal_eml, MockImapServer, MockImapServerHandle,
+        examine_response, minimal_eml, uid_fetch_metadata_response, uid_fetch_rfc822_response,
+        MockImapServer, MockImapServerHandle,
     };
 
     /// Build an `async_imap::Session` connected to the mock server,
@@ -1646,9 +1775,11 @@ mod tests {
         client.read_response().await.unwrap();
 
         // Login
-        let mut session = client.login("user", "pass").await.map_err(|(e, _)| {
-            panic!("Login failed: {e:?}")
-        }).unwrap();
+        let mut session = client
+            .login("user", "pass")
+            .await
+            .map_err(|(e, _)| panic!("Login failed: {e:?}"))
+            .unwrap();
 
         // Examine
         session.examine("INBOX").await.unwrap();
@@ -1661,37 +1792,28 @@ mod tests {
         let handle = MockImapServer::new()
             .respond("LOGIN", "{TAG} OK LOGIN done\r\n")
             .respond("EXAMINE", examine_response("INBOX", 3, 42, 4))
-            .respond("UID FETCH", uid_fetch_metadata_response(&[
-                (1, "<msg-a@test.com>"),
-                (2, "<msg-b@test.com>"),
-                (3, "<msg-c@test.com>"),
-            ]))
+            .respond(
+                "UID FETCH",
+                uid_fetch_metadata_response(&[
+                    (1, "<msg-a@test.com>"),
+                    (2, "<msg-b@test.com>"),
+                    (3, "<msg-c@test.com>"),
+                ]),
+            )
             .start()
             .await;
 
         let mut session = mock_session(&handle).await;
 
-        let result = ImapExecutor::fetch_uid_metadata(
-            &mut session,
-            "1:3",
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        let result =
+            ImapExecutor::fetch_uid_metadata(&mut session, "1:3", CancellationToken::new())
+                .await
+                .unwrap();
 
         assert_eq!(result.len(), 3);
-        assert_eq!(
-            result.get(&1).unwrap().as_deref(),
-            Some("msg-a@test.com")
-        );
-        assert_eq!(
-            result.get(&2).unwrap().as_deref(),
-            Some("msg-b@test.com")
-        );
-        assert_eq!(
-            result.get(&3).unwrap().as_deref(),
-            Some("msg-c@test.com")
-        );
+        assert_eq!(result.get(&1).unwrap().as_deref(), Some("msg-a@test.com"));
+        assert_eq!(result.get(&2).unwrap().as_deref(), Some("msg-b@test.com"));
+        assert_eq!(result.get(&3).unwrap().as_deref(), Some("msg-c@test.com"));
 
         session.logout().await.ok();
     }
@@ -1716,10 +1838,7 @@ mod tests {
         let mut session = mock_session(&handle).await;
 
         let uids: Vec<u32> = {
-            let mut stream = session
-                .uid_fetch("1:2", "(UID FLAGS)")
-                .await
-                .unwrap();
+            let mut stream = session.uid_fetch("1:2", "(UID FLAGS)").await.unwrap();
 
             use futures::TryStreamExt;
             let mut uids = Vec::new();
@@ -1750,10 +1869,7 @@ mod tests {
         let mut session = mock_session(&handle).await;
 
         let bodies: Vec<(u32, Vec<u8>)> = {
-            let mut stream = session
-                .uid_fetch("1:1", "(UID BODY[])")
-                .await
-                .unwrap();
+            let mut stream = session.uid_fetch("1:1", "(UID BODY[])").await.unwrap();
 
             use futures::TryStreamExt;
             let mut bodies = Vec::new();
@@ -1784,18 +1900,12 @@ mod tests {
 
         let mut session = mock_session(&handle).await;
 
-        let result = ImapExecutor::fetch_uid_metadata(
-            &mut session,
-            "1:*",
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        let result =
+            ImapExecutor::fetch_uid_metadata(&mut session, "1:*", CancellationToken::new())
+                .await
+                .unwrap();
 
-        assert!(
-            result.is_empty(),
-            "empty mailbox should return empty map"
-        );
+        assert!(result.is_empty(), "empty mailbox should return empty map");
 
         session.logout().await.ok();
     }
@@ -1803,8 +1913,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_uid_metadata_missing_message_id() {
         // One entry has a Message-ID, the other has no header at all.
-        let header_with_msgid =
-            "From: sender@example.com\r\n\
+        let header_with_msgid = "From: sender@example.com\r\n\
              Date: Thu, 01 Jan 2025 00:00:00 +0000\r\n\
              Message-ID: <ok@test.com>\r\n\r\n";
         let header_without_msgid = "\r\n";
@@ -1830,19 +1939,13 @@ mod tests {
 
         let mut session = mock_session(&handle).await;
 
-        let result = ImapExecutor::fetch_uid_metadata(
-            &mut session,
-            "1:2",
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        let result =
+            ImapExecutor::fetch_uid_metadata(&mut session, "1:2", CancellationToken::new())
+                .await
+                .unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(
-            result.get(&1).unwrap().as_deref(),
-            Some("ok@test.com")
-        );
+        assert_eq!(result.get(&1).unwrap().as_deref(), Some("ok@test.com"));
         // UID 2 has no Message-ID header → None
         assert_eq!(result.get(&2).unwrap().as_deref(), None);
 

@@ -18,12 +18,16 @@
 
 use crate::error::BichonResult;
 use crate::store::tantivy::attachment::ATTACHMENT_MANAGER;
-use crate::store::tantivy::envelope::ENVELOPE_MANAGER;
+use crate::store::tantivy::envelope::{
+    ENVELOPE_MANAGER, UIDONLY_ACQUISITION_LIFECYCLE_GATE, UIDONLY_CANONICAL_WRITE_LOCK,
+};
 use std::collections::HashMap;
 
 pub async fn delete_messages_impl(request: HashMap<u64, Vec<String>>) -> BichonResult<()> {
+    let _uidonly_lifecycle_guard = UIDONLY_ACQUISITION_LIFECYCLE_GATE.write().await;
+    let _uidonly_write_guard = UIDONLY_CANONICAL_WRITE_LOCK.lock().await;
     ENVELOPE_MANAGER
-        .delete_envelopes_multi_account(request.clone())
+        .delete_envelopes_multi_account_locked(request.clone())
         .await?;
     ATTACHMENT_MANAGER
         .delete_attachments_multi_account(request)

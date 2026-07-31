@@ -446,13 +446,14 @@ impl Account {
     pub async fn delete(account_id: u64) -> BichonResult<()> {
         let account = Self::get(account_id)?;
 
-        // Immediately stop scheduling to prevent new downloads
+        // Atomically block new scheduled/manual registrations, then cancel
+        // and join both task classes before marking or cleaning the account.
         if matches!(account.account_type, AccountType::IMAP) {
-            SYNC_TASKS.stop(account.id).await?;
+            SYNC_TASKS.begin_account_deletion(account.id).await?;
         }
 
         // Mark as deleting and disabled so frontend shows status and download tasks skip it
-        update_impl(
+        if let Err(error) = update_impl(
             DB_MANAGER.db(),
             &account_id.to_string(),
             move |current: Account| {
@@ -461,7 +462,12 @@ impl Account {
                 updated.enabled = false;
                 Ok(updated)
             },
-        )?;
+        ) {
+            if matches!(account.account_type, AccountType::IMAP) {
+                SYNC_TASKS.end_account_deletion(account.id).await;
+            }
+            return Err(error);
+        }
 
         // Spawn background cleanup — heavy work (Tantivy, attachments) runs off the request path
         tokio::spawn(async move {
@@ -482,6 +488,9 @@ impl Account {
                         Ok(updated)
                     },
                 );
+                if matches!(account.account_type, AccountType::IMAP) {
+                    SYNC_TASKS.end_account_deletion(account.id).await;
+                }
             }
         });
 
@@ -494,18 +503,25 @@ impl Account {
 
     async fn cleanup_account_resources_sequential(account: &AccountModel) -> BichonResult<()> {
         // Sync task already stopped in delete() before spawning this background task
+        let _uidonly_lifecycle_guard =
+            crate::store::tantivy::envelope::UIDONLY_ACQUISITION_LIFECYCLE_GATE
+                .write()
+                .await;
         if matches!(account.account_type, AccountType::IMAP) {
             DownloadState::delete(account.id)?;
         }
         OAuth2AccessToken::try_delete(account.id)?;
         UserModel::cleanup_account(account.id)?;
+        let _uidonly_write_guard = crate::store::tantivy::envelope::UIDONLY_CANONICAL_WRITE_LOCK
+            .lock()
+            .await;
         crate::imap::uidonly_acquisition::cleanup_uidonly_account_state(
             &DATA_DIR_MANAGER.storage_dir.join("uidonly-acquisition"),
             account.id,
         )?;
         MailBox::clean(account.id)?;
         ENVELOPE_MANAGER
-            .delete_account_envelopes(account.id)
+            .delete_account_envelopes_locked(account.id)
             .await?;
         ATTACHMENT_MANAGER
             .delete_account_attachments(account.id)

@@ -669,6 +669,36 @@ async fn per_command_literal_ceiling_rejects_before_accepting_body_octets() {
 }
 
 #[tokio::test]
+async fn per_command_literal_ceiling_is_cumulative_across_markers() {
+    let transcript = b"* ENABLED UIDONLY\r\nA0009 OK ENABLE completed\r\n\
+* 42 UIDFETCH (UID 42 BODY[] {3}\r\nabc BODY[HEADER] {3}\r\ndef)\r\n\
+A0010 OK FETCH completed\r\n"
+        .to_vec();
+    let (io, _) = ScriptedIo::new(transcript);
+    let (mut adapter, handle) = UidOnlyAdapter::new(io, AdapterLimits::default()).unwrap();
+    handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
+
+    let mut observed = activate_direct_adapter(&mut adapter, &handle, 5).await;
+    let error = adapter.read_to_end(&mut observed).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(handle.literal_bytes_received(), 3);
+    assert_eq!(
+        handle.poison_reason().as_deref(),
+        Some("literal exceeds configured byte limit")
+    );
+    assert!(observed.windows(3).any(|bytes| bytes == b"abc"));
+    assert!(!observed.windows(3).any(|bytes| bytes == b"def"));
+    assert_eq!(
+        observed
+            .windows(5)
+            .filter(|bytes| *bytes == b"{3}\r\n")
+            .count(),
+        1,
+        "the over-budget second marker must be withheld"
+    );
+}
+
+#[tokio::test]
 async fn unsupported_and_overflowing_active_literal_markers_fail_before_forwarding() {
     for marker in ["{1+}", "~{1}", "{999999999999999999999999999999999999}"] {
         let transcript = format!(

@@ -215,7 +215,7 @@ struct SharedState {
 #[derive(Debug)]
 struct ActiveCommand {
     tag: Vec<u8>,
-    max_literal_bytes: usize,
+    remaining_literal_bytes: usize,
 }
 
 /// Control handle paired with one [`UidOnlyAdapter`].
@@ -260,7 +260,7 @@ impl AdapterHandle {
         }
         shared.active_command = Some(ActiveCommand {
             tag: request_id.as_bytes().to_vec(),
-            max_literal_bytes,
+            remaining_literal_bytes: max_literal_bytes,
         });
         Ok(())
     }
@@ -528,23 +528,23 @@ impl<T> UidOnlyAdapter<T> {
         };
 
         if let Some(length) = literal {
-            let active_command_limit = if matches!(mode, Mode::Active) {
-                let limit = self
+            let active_command_remaining = if matches!(mode, Mode::Active) {
+                let remaining = self
                     .shared
                     .lock()
                     .expect("adapter mutex poisoned")
                     .active_command
                     .as_ref()
-                    .map(|command| command.max_literal_bytes);
-                let Some(limit) = limit else {
+                    .map(|command| command.remaining_literal_bytes);
+                let Some(remaining) = remaining else {
                     return Err(self.poison("literal arrived outside an active command"));
                 };
-                Some(limit)
+                Some(remaining)
             } else {
                 None
             };
             if length > self.limits.max_literal_bytes.get()
-                || active_command_limit.is_some_and(|limit| length > limit)
+                || active_command_remaining.is_some_and(|remaining| length > remaining)
             {
                 return Err(self.poison("literal exceeds configured byte limit"));
             }
@@ -554,6 +554,17 @@ impl<T> UidOnlyAdapter<T> {
                 .ok_or_else(|| self.poison("response byte count overflow"))?;
             if projected_response_bytes > self.limits.max_response_bytes.get() {
                 return Err(self.poison("announced literal exceeds remaining response budget"));
+            }
+            if active_command_remaining.is_some() {
+                let mut shared = self.shared.lock().expect("adapter mutex poisoned");
+                let Some(command) = shared.active_command.as_mut() else {
+                    drop(shared);
+                    return Err(self.poison("literal arrived outside an active command"));
+                };
+                command.remaining_literal_bytes = command
+                    .remaining_literal_bytes
+                    .checked_sub(length)
+                    .expect("active command literal budget was validated");
             }
             self.literal_remaining = length;
             self.emit.extend(wire_line);

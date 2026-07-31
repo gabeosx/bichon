@@ -33,18 +33,18 @@ path. UIDONLY without PARTIAL, a standalone MESSAGELIMIT, or an invalid
 MESSAGELIMIT fails closed because Bichon cannot claim a complete snapshot.
 
 The integrated acquisition path fixes a mailbox snapshot at UIDNEXT - 1,
-inventories sparse UID ranges with PARTIAL, fetches exact UID body chunks, and
-records VANISHED evidence. Its durable identity is endpoint, account, canonical
-mailbox, UIDVALIDITY, and UID. Per-UID ledger transitions are fsynced around
-staging and canonical projection, and a checkpoint is written only after every
-canonical blob, envelope, and attachment record passes exact readback
-verification. Exact RFC822 values and encoded attachment slices use UIDONLY
-namespaced blob keys, avoiding collisions with the legacy detached-message
-representation; malformed or empty stored literals receive a minimal fallback
-envelope without changing their raw bytes. A tagged-OK body miss is not treated
-as proof of deletion: Bichon performs an exact one-UID inventory request and
-records absence only after that request completes empty. Reconnects start a
-fresh bounded connection, re-enable UIDONLY,
+inventories sparse UID ranges with PARTIAL, and fetches each exact UID body
+chunk with a `PARTIAL 1:1` result bound. It records VANISHED evidence. Its
+durable identity is endpoint, account, canonical mailbox, UIDVALIDITY, and UID.
+Per-UID ledger transitions are fsynced around staging and canonical projection,
+and a checkpoint is written only after every canonical blob, envelope, and
+attachment record passes exact readback verification. Exact RFC822 values and
+encoded attachment slices use UIDONLY namespaced blob keys, avoiding collisions
+with the legacy detached-message representation; malformed or empty stored
+literals receive a minimal fallback envelope without changing their raw bytes.
+A tagged-OK body miss is not treated as proof of deletion: Bichon performs an
+exact one-UID inventory request and records absence only after that request
+completes empty. Reconnects start a fresh bounded connection, re-enable UIDONLY,
 reselect the mailbox, and refuse a changed UIDVALIDITY epoch or a changed
 connection identity (endpoint, authenticated principal, encryption, proxy,
 authentication mode, or dangerous-TLS setting). Empty full-mailbox folders use

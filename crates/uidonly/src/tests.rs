@@ -826,7 +826,8 @@ async fn exact_body_chunk_returns_literal_and_rejects_adjacent_uid_or_wrong_orig
     );
     let written =
         String::from_utf8(written.lock().expect("written mutex poisoned").clone()).unwrap();
-    assert!(written.contains("A0003 UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[]<0.1024>)\r\n"));
+    assert!(written
+        .contains("A0003 UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[]<0.1024>) (PARTIAL 1:1)\r\n"));
 
     for (response, expected) in [
         (
@@ -1141,7 +1142,7 @@ fn typed_command_builder_quotes_mailbox_and_rejects_injection() {
         }
         .render(&limits)
         .unwrap(),
-        "UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[]<1024.4096>)"
+        "UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[]<1024.4096>) (PARTIAL 1:1)"
     );
 }
 

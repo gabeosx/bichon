@@ -1032,8 +1032,10 @@ impl UidOnlyCommand {
                 offset.checked_add(count.get()).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "body chunk range overflows")
                 })?;
+                // Keep an explicit one-result bound on exact-UID body reads. Some
+                // UIDONLY servers require the PARTIAL result modifier on FETCH.
                 Ok(format!(
-                    "UID FETCH {} (UID RFC822.SIZE BODY.PEEK[]<{}.{}>)",
+                    "UID FETCH {} (UID RFC822.SIZE BODY.PEEK[]<{}.{}>) (PARTIAL 1:1)",
                     uid, offset, count
                 ))
             }

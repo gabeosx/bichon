@@ -872,6 +872,30 @@ async fn exact_body_chunk_returns_literal_and_rejects_adjacent_uid_or_wrong_orig
 }
 
 #[tokio::test]
+async fn tagged_command_rejections_preserve_only_the_safe_status_class() {
+    for (status, expected) in [
+        ("NO", "UIDONLY command completed with tagged NO"),
+        ("BAD", "UIDONLY command completed with tagged BAD"),
+    ] {
+        let response = format!("A0003 {status} private provider detail\r\n");
+        let transcript = fixture_with_after_enable(response.as_bytes());
+        let (session, _, _) = activated_session(
+            transcript,
+            AdapterLimits::default(),
+            CommandLimits::default(),
+        )
+        .await;
+        let error = session
+            .fetch_body_chunk(nz(42), 0, nz(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), expected);
+        assert!(!error.to_string().contains("private provider detail"));
+    }
+}
+
+#[tokio::test]
 async fn literal_meter_charges_body_octets_before_truncated_command_completion() {
     let raw = b"received before eof";
     let transcript = fixture_with_after_enable(

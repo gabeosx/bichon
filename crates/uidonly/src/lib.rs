@@ -1347,7 +1347,12 @@ where
                         return Err(invalid_data("unexpected tagged response"));
                     }
                     if status != &Status::Ok {
-                        return Err(invalid_data("command did not complete with OK"));
+                        let failure = match status {
+                            Status::No => "UIDONLY command completed with tagged NO",
+                            Status::Bad => "UIDONLY command completed with tagged BAD",
+                            _ => "UIDONLY command completed with unexpected tagged status",
+                        };
+                        return Err(invalid_data(failure));
                     }
                     match code {
                         Some(ResponseCode::ReadOnly)

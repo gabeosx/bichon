@@ -12,7 +12,7 @@ The crate:
 - translates only top-level `UIDFETCH` labels outside literals;
 - attaches bounded, ordered provenance to every post-enable response;
 - moves an enabled connection into a private low-level-only typestate;
-- exposes typed `EXAMINE`, bounded PARTIAL inventory, exact-UID body chunk,
+- exposes typed `EXAMINE`, bounded PARTIAL inventory, exact-UID full-body fetch,
   `NOOP`, and `LOGOUT` operations;
 - rejects raw `FETCH`, sequence `EXPUNGE`, UID mismatches, malformed literals,
   unexpected tags, cancellation, timeouts, EOF, and resource overruns; and
@@ -33,8 +33,10 @@ path. UIDONLY without PARTIAL, a standalone MESSAGELIMIT, or an invalid
 MESSAGELIMIT fails closed because Bichon cannot claim a complete snapshot.
 
 The integrated acquisition path fixes a mailbox snapshot at UIDNEXT - 1,
-inventories sparse UID ranges with PARTIAL, and fetches each exact UID body
-chunk with a `PARTIAL 1:1` result bound. It records VANISHED evidence. Its
+inventories sparse UID ranges with PARTIAL, and fetches each exact UID with one
+full `BODY.PEEK[]` request. The exact UID set bounds the command to at most one
+result, while the adapter rejects an oversized literal announcement before
+body bytes reach the parser. It records VANISHED evidence. Its
 durable identity is endpoint, account, canonical mailbox, UIDVALIDITY, and UID.
 Per-UID ledger transitions are fsynced around staging and canonical projection,
 and a checkpoint is written only after every canonical blob, envelope, and
@@ -66,7 +68,7 @@ their raw bodies are identical.
 `AdapterLimits` bounds input, control lines, literals, complete responses, and
 the ordered provenance queue. `CommandLimits` independently bounds time,
 response count, cumulative wire bytes, unsolicited events, inventory pages,
-body chunks, and mailbox command bytes. Protocol ambiguity, cancellation, EOF,
+and mailbox command bytes. Protocol ambiguity, cancellation, EOF,
 or any exceeded ceiling consumes and drops the typed session; it never falls
 back to sequence-number behavior. Message literals and credentials are not
 logged by this crate.
@@ -81,8 +83,9 @@ The production defaults admit at most 1,000,000 inventory entries, 100 GiB of
 actual body transfer, 512 MiB of serialized ledger state, 120 GiB of
 UIDONLY-owned staging plus durable conservative canonical reservations, and six
 hours including the global semaphore wait. The configured per-message ceiling
-defaults to 100 MiB; body reads use exact chunks no larger than 1 MiB. The
-body-transfer meter charges literal octets before tagged command completion,
+defaults to 100 MiB; each exact full-body literal is rejected before acceptance
+if its announcement exceeds that ceiling. The body-transfer meter charges
+literal octets before tagged command completion,
 so a truncated response remains charged across reconnect and retry. The
 memory ceiling is shared by the durable inventory, the remote/local difference
 vectors, and one projection: the effective per-message admission size therefore
@@ -95,6 +98,13 @@ acquisition because its external extractors do not expose an enforceable
 allocator budget; raw attachments and metadata remain archived. These are
 explicit admission and pipeline bounds, not an operating-system allocator
 quota.
+
+Adapter failures expose only a bounded diagnostic class (for example, resource
+ceiling, truncated response, literal framing, forbidden response shape,
+provenance, or activation). The acquisition layer records that class in the
+durable per-UID ledger so an operator can identify the failing UID and protocol
+phase without logging provider response text, credentials, headers, or message
+bytes.
 
 Each created canonical projection retains a conservative disk reservation in
 the checksummed ledger across restarts; reservations intentionally overcount

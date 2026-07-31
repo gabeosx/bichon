@@ -101,36 +101,31 @@ impl AcquisitionLimits {
         }
     }
 
-    fn body_chunk_size(self) -> BichonResult<NonZeroU32> {
-        let bytes = self.max_literal_bytes.min(1024 * 1024).min(u32::MAX as u64);
-        NonZeroU32::new(bytes as u32).ok_or_else(|| {
+    pub fn adapter_limits(self) -> BichonResult<AdapterLimits> {
+        let literal = usize::try_from(self.max_literal_bytes).map_err(|_| {
             raise_error!(
-                "UIDONLY body chunk ceiling must be nonzero".into(),
+                "UIDONLY literal ceiling does not fit usize".into(),
                 ErrorCode::InvalidParameter
             )
-        })
-    }
-
-    pub fn adapter_limits(self) -> BichonResult<AdapterLimits> {
-        let chunk = self.body_chunk_size()?.get() as usize;
+        })?;
         let configured_response = usize::try_from(self.max_response_bytes).map_err(|_| {
             raise_error!(
                 "response ceiling does not fit usize".into(),
                 ErrorCode::InvalidParameter
             )
         })?;
-        let response = configured_response.min(chunk.saturating_add(1024 * 1024));
+        let response = configured_response.min(literal.saturating_add(1024 * 1024));
         let control = 64 * 1024;
-        if response < chunk || response < control {
+        if literal == 0 || response < literal || response < control {
             return Err(raise_error!(
-                "UIDONLY response ceiling must cover control lines and one body chunk".into(),
+                "UIDONLY response ceiling must cover control lines and one body literal".into(),
                 ErrorCode::InvalidParameter
             ));
         }
         Ok(AdapterLimits {
             max_input_bytes: NonZeroUsize::new(control).expect("constant is nonzero"),
             max_control_line_bytes: NonZeroUsize::new(control).expect("constant is nonzero"),
-            max_literal_bytes: NonZeroUsize::new(chunk).expect("validated nonzero"),
+            max_literal_bytes: NonZeroUsize::new(literal).expect("validated nonzero"),
             max_response_bytes: NonZeroUsize::new(response).expect("validated nonzero"),
             provenance_capacity: NonZeroUsize::new(64).expect("constant is nonzero"),
         })
@@ -162,7 +157,20 @@ impl AcquisitionLimits {
             max_events: NonZeroUsize::new(event_limit).expect("clamped nonzero"),
             max_vanished_ranges: NonZeroUsize::new(event_limit).expect("clamped nonzero"),
             max_inventory_page: page,
-            max_body_chunk_bytes: self.body_chunk_size()?,
+            max_body_literal_bytes: NonZeroUsize::new(
+                usize::try_from(self.max_literal_bytes).map_err(|_| {
+                    raise_error!(
+                        "UIDONLY body literal ceiling does not fit usize".into(),
+                        ErrorCode::InvalidParameter
+                    )
+                })?,
+            )
+            .ok_or_else(|| {
+                raise_error!(
+                    "UIDONLY body literal ceiling must be nonzero".into(),
+                    ErrorCode::InvalidParameter
+                )
+            })?,
             max_mailbox_wire_bytes: NonZeroUsize::new(4096).expect("constant is nonzero"),
         })
     }
@@ -3227,7 +3235,6 @@ struct SessionUidOnlyTransport {
     message_limit: Option<NonZeroU32>,
     adapter_limits: AdapterLimits,
     command_limits: CommandLimits,
-    body_chunk_size: NonZeroU32,
     max_literal_bytes: u64,
     remaining_transfer_bytes: u64,
     expected_identity: Option<AcquisitionConnectionIdentity>,
@@ -3239,7 +3246,6 @@ struct SessionTransportConfig {
     message_limit: Option<NonZeroU32>,
     adapter_limits: AdapterLimits,
     command_limits: CommandLimits,
-    body_chunk_size: NonZeroU32,
     max_literal_bytes: u64,
     max_total_bytes: u64,
     expected_identity: Option<AcquisitionConnectionIdentity>,
@@ -3256,7 +3262,6 @@ impl SessionUidOnlyTransport {
             message_limit: config.message_limit,
             adapter_limits: config.adapter_limits,
             command_limits: config.command_limits,
-            body_chunk_size: config.body_chunk_size,
             max_literal_bytes: config.max_literal_bytes,
             remaining_transfer_bytes: config.max_total_bytes,
             expected_identity: config.expected_identity,
@@ -3371,79 +3376,62 @@ impl UidOnlyTransport for SessionUidOnlyTransport {
     async fn fetch_uid(&mut self, uid: u32) -> Result<FetchOutcome, TransportFailure> {
         let uid = NonZeroU32::new(uid)
             .ok_or_else(|| TransportFailure::command("body UID must be nonzero"))?;
-        let mut offset = 0u32;
-        let mut expected_size = None;
-        let mut raw = Vec::new();
-        loop {
-            let requested_bytes = self
-                .remaining_transfer_bytes
-                .min(u64::from(self.body_chunk_size.get()))
-                .min(u64::from(u32::MAX));
-            let requested_bytes = NonZeroU32::new(requested_bytes as u32).ok_or_else(|| {
-                TransportFailure::command("UIDONLY total transfer byte ceiling exhausted")
+        if self.remaining_transfer_bytes == 0 {
+            return Err(TransportFailure::command(
+                "UIDONLY total transfer byte ceiling exhausted",
+            ));
+        }
+        let session = self.take_session()?;
+        let command_literal_bytes = self.remaining_transfer_bytes.min(self.max_literal_bytes);
+        let command_literal_bytes = usize::try_from(command_literal_bytes)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                TransportFailure::command("UIDONLY command literal ceiling is invalid")
             })?;
-            let session = self.take_session()?;
-            let literal_meter = session.literal_byte_meter();
-            let literal_bytes_before = literal_meter.literal_bytes_received();
-            let result = session.fetch_body_chunk(uid, offset, requested_bytes).await;
-            let received_literal_bytes = literal_meter
-                .literal_bytes_received()
-                .checked_sub(literal_bytes_before)
-                .ok_or_else(|| TransportFailure::command("literal byte counter moved backwards"))?;
-            if received_literal_bytes > self.remaining_transfer_bytes {
-                self.remaining_transfer_bytes = 0;
-                return Err(TransportFailure::command(
-                    "UIDONLY total transfer byte ceiling exceeded while receiving a body literal",
-                ));
+        let literal_meter = session.literal_byte_meter();
+        let literal_bytes_before = literal_meter.literal_bytes_received();
+        let result = session.fetch_body(uid, command_literal_bytes).await;
+        let received_literal_bytes = literal_meter
+            .literal_bytes_received()
+            .checked_sub(literal_bytes_before)
+            .ok_or_else(|| TransportFailure::command("literal byte counter moved backwards"))?;
+        if received_literal_bytes > self.remaining_transfer_bytes {
+            self.remaining_transfer_bytes = 0;
+            return Err(TransportFailure::command(
+                "UIDONLY total transfer byte ceiling exceeded while receiving a body literal",
+            ));
+        }
+        self.remaining_transfer_bytes -= received_literal_bytes;
+        let (session, outcome) = result.map_err(classify_transport)?;
+        self.session = Some(session);
+        match outcome {
+            ExactFetchOutcome::Message(body) => {
+                self.record_notifications(&body.notifications);
+                if u64::from(body.rfc822_size) > self.max_literal_bytes {
+                    return Err(TransportFailure::command(format!(
+                        "UID {} declared size {} exceeds configured literal ceiling {}",
+                        uid, body.rfc822_size, self.max_literal_bytes
+                    )));
+                }
+                if body.bytes.len() as u64 > self.max_literal_bytes {
+                    return Err(TransportFailure::command(format!(
+                        "UID {} body exceeds configured literal ceiling {}",
+                        uid, self.max_literal_bytes
+                    )));
+                }
+                Ok(FetchOutcome::Message {
+                    declared_size: Some(u64::from(body.rfc822_size)),
+                    raw: body.bytes,
+                })
             }
-            self.remaining_transfer_bytes -= received_literal_bytes;
-            let (session, outcome) = result.map_err(classify_transport)?;
-            self.session = Some(session);
-            match outcome {
-                ExactFetchOutcome::Chunk(chunk) => {
-                    self.record_notifications(&chunk.notifications);
-                    if expected_size
-                        .replace(chunk.rfc822_size)
-                        .is_some_and(|size| size != chunk.rfc822_size)
-                    {
-                        return Err(TransportFailure::command(format!(
-                            "UID {} changed RFC822.SIZE during exact body fetch",
-                            uid
-                        )));
-                    }
-                    if u64::from(chunk.rfc822_size) > self.max_literal_bytes {
-                        return Err(TransportFailure::command(format!(
-                            "UID {} declared size {} exceeds configured literal ceiling {}",
-                            uid, chunk.rfc822_size, self.max_literal_bytes
-                        )));
-                    }
-                    raw.try_reserve(chunk.bytes.len()).map_err(|_| {
-                        TransportFailure::command("body allocation exceeded process limits")
-                    })?;
-                    raw.extend_from_slice(&chunk.bytes);
-                    offset = offset
-                        .checked_add(chunk.bytes.len() as u32)
-                        .ok_or_else(|| TransportFailure::command("body offset overflow"))?;
-                    if offset == chunk.rfc822_size {
-                        return Ok(FetchOutcome::Message {
-                            declared_size: Some(u64::from(chunk.rfc822_size)),
-                            raw,
-                        });
-                    }
-                    if offset > chunk.rfc822_size || chunk.bytes.is_empty() {
-                        return Err(TransportFailure::command(
-                            "exact body fetch made invalid progress",
-                        ));
-                    }
-                }
-                ExactFetchOutcome::Vanished { notifications, .. } => {
-                    self.record_notifications(&notifications);
-                    return Ok(FetchOutcome::Vanished);
-                }
-                ExactFetchOutcome::Missing { notifications, .. } => {
-                    self.record_notifications(&notifications);
-                    return Ok(FetchOutcome::Missing);
-                }
+            ExactFetchOutcome::Vanished { notifications, .. } => {
+                self.record_notifications(&notifications);
+                Ok(FetchOutcome::Vanished)
+            }
+            ExactFetchOutcome::Missing { notifications, .. } => {
+                self.record_notifications(&notifications);
+                Ok(FetchOutcome::Missing)
             }
         }
     }
@@ -3491,7 +3479,6 @@ pub(crate) async fn acquire_bichon_mailbox(
     let identity = AcquisitionIdentity::from_account(account, mailbox)?;
     let adapter_limits = limits.adapter_limits()?;
     let command_limits = limits.command_limits()?;
-    let body_chunk_size = limits.body_chunk_size()?;
     let mut transport = SessionUidOnlyTransport::new(
         session,
         SessionTransportConfig {
@@ -3499,7 +3486,6 @@ pub(crate) async fn acquire_bichon_mailbox(
             message_limit,
             adapter_limits,
             command_limits,
-            body_chunk_size,
             max_literal_bytes: limits.max_literal_bytes,
             max_total_bytes: limits.max_total_bytes,
             expected_identity: Some(acquisition_connection_identity(account)?),
@@ -6581,7 +6567,7 @@ ZmFpbGVk\r\n\
 
     fn uidfetch_body(uid: u32, raw: &[u8]) -> Vec<u8> {
         let mut response = format!(
-            "* {uid} UIDFETCH (UID {uid} RFC822.SIZE {} BODY[]<0> {{{}}}\r\n",
+            "* {uid} UIDFETCH (UID {uid} RFC822.SIZE {} BODY[] {{{}}}\r\n",
             raw.len(),
             raw.len()
         )
@@ -6593,7 +6579,7 @@ ZmFpbGVk\r\n\
 
     fn uidfetch_body_without_completion(uid: u32, raw: &[u8]) -> Vec<u8> {
         let mut response = format!(
-            "* {uid} UIDFETCH (UID {uid} RFC822.SIZE {} BODY[]<0> {{{}}}\r\n",
+            "* {uid} UIDFETCH (UID {uid} RFC822.SIZE {} BODY[] {{{}}}\r\n",
             raw.len(),
             raw.len()
         )
@@ -6679,7 +6665,6 @@ ZmFpbGVk\r\n\
                 message_limit,
                 adapter_limits: limits.adapter_limits().unwrap(),
                 command_limits: limits.command_limits().unwrap(),
-                body_chunk_size: limits.body_chunk_size().unwrap(),
                 max_literal_bytes: limits.max_literal_bytes,
                 max_total_bytes: limits.max_total_bytes,
                 expected_identity: None,
@@ -6805,7 +6790,6 @@ ZmFpbGVk\r\n\
                 message_limit,
                 adapter_limits: test_limits.adapter_limits().unwrap(),
                 command_limits: test_limits.command_limits().unwrap(),
-                body_chunk_size: test_limits.body_chunk_size().unwrap(),
                 max_literal_bytes: test_limits.max_literal_bytes,
                 max_total_bytes: test_limits.max_total_bytes,
                 expected_identity: Some(
@@ -6866,7 +6850,7 @@ ZmFpbGVk\r\n\
                 "A0003 ENABLE UIDONLY",
                 "A0004 EXAMINE \"INBOX\"",
                 "A0005 UID FETCH 1:7 (UID RFC822.SIZE INTERNALDATE) (PARTIAL 1:2)",
-                "A0006 UID FETCH 7 (UID RFC822.SIZE BODY.PEEK[]<0.1048576>) (PARTIAL 1:1)",
+                "A0006 UID FETCH 7 (UID RFC822.SIZE BODY.PEEK[])",
                 "A0001 LOGIN \"route-test\" \"synthetic-manager-password\"",
                 "A0002 CAPABILITY",
                 "A0003 CAPABILITY",
@@ -6875,7 +6859,7 @@ ZmFpbGVk\r\n\
                 "A0002 CAPABILITY",
                 "A0003 ENABLE UIDONLY",
                 "A0004 EXAMINE \"INBOX\"",
-                "A0005 UID FETCH 7 (UID RFC822.SIZE BODY.PEEK[]<0.1048576>) (PARTIAL 1:1)",
+                "A0005 UID FETCH 7 (UID RFC822.SIZE BODY.PEEK[])",
                 "A0006 LOGOUT",
             ],
             "probe, activation, disconnect, reconnect, re-enable, re-examine, retry, and logout must remain exactly ordered and read-only"
@@ -7034,7 +7018,6 @@ ZmFpbGVk\r\n\
                 message_limit,
                 adapter_limits: test_limits.adapter_limits().unwrap(),
                 command_limits: test_limits.command_limits().unwrap(),
-                body_chunk_size: test_limits.body_chunk_size().unwrap(),
                 max_literal_bytes: test_limits.max_literal_bytes,
                 max_total_bytes: test_limits.max_total_bytes,
                 expected_identity: Some(
@@ -7141,9 +7124,9 @@ ZmFpbGVk\r\n\
                 "EXAMINE \"INBOX\"",
                 "UID FETCH 1:50 (UID RFC822.SIZE INTERNALDATE) (PARTIAL 1:2)",
                 "UID FETCH 31:50 (UID RFC822.SIZE INTERNALDATE) (PARTIAL 1:2)",
-                "UID FETCH 2 (UID RFC822.SIZE BODY.PEEK[]<0.1048576>) (PARTIAL 1:1)",
-                "UID FETCH 30 (UID RFC822.SIZE BODY.PEEK[]<0.1048576>) (PARTIAL 1:1)",
-                "UID FETCH 50 (UID RFC822.SIZE BODY.PEEK[]<0.1048576>) (PARTIAL 1:1)",
+                "UID FETCH 2 (UID RFC822.SIZE BODY.PEEK[])",
+                "UID FETCH 30 (UID RFC822.SIZE BODY.PEEK[])",
+                "UID FETCH 50 (UID RFC822.SIZE BODY.PEEK[])",
                 "LOGOUT",
             ],
             "the complete UIDONLY transcript must remain read-only and ordered"
@@ -7172,13 +7155,13 @@ ZmFpbGVk\r\n\
         };
         let session = transcript_session(&server, small_limits).await;
         let error = session
-            .fetch_body_chunk(NonZeroU32::new(7).unwrap(), 0, NonZeroU32::new(4).unwrap())
+            .fetch_body(NonZeroU32::new(7).unwrap(), NonZeroUsize::new(4).unwrap())
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
             error.to_string(),
-            "UIDONLY IMAP response read or parse failed"
+            "UIDONLY adapter resource ceiling exceeded"
         );
     }
 

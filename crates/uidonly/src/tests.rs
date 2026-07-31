@@ -219,6 +219,25 @@ fn nz(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).expect("test value is nonzero")
 }
 
+fn nzs(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).expect("test value is nonzero")
+}
+
+async fn activate_direct_adapter(
+    adapter: &mut UidOnlyAdapter<ScriptedIo>,
+    handle: &AdapterHandle,
+    max_literal_bytes: usize,
+) -> Vec<u8> {
+    const ACTIVATION: &[u8] = b"* ENABLED UIDONLY\r\nA0009 OK ENABLE completed\r\n";
+    let mut observed = vec![0_u8; ACTIVATION.len()];
+    adapter.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, ACTIVATION);
+    handle
+        .arm_command(&RequestId("A0010".to_string()), max_literal_bytes)
+        .unwrap();
+    observed
+}
+
 #[tokio::test]
 async fn coalesced_enable_and_uidfetch_preserve_provenance() {
     let transcript = fixture_with_after_enable(
@@ -388,7 +407,7 @@ async fn literal_bytes_survive_fragmentation_pending_and_tiny_output_buffers() {
             let (mut adapter, handle) = UidOnlyAdapter::new(io, AdapterLimits::default()).unwrap();
             handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
 
-            let mut observed = Vec::new();
+            let mut observed = activate_direct_adapter(&mut adapter, &handle, body.len()).await;
             let mut output = vec![0_u8; output_size];
             loop {
                 let read = adapter.read(&mut output).await.unwrap();
@@ -477,7 +496,7 @@ async fn multi_literal_and_randomized_pending_fragmentation_preserve_bytes() {
         handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
         let output_size = case % 32 + 1;
         let mut output = vec![0_u8; output_size];
-        let mut observed = Vec::new();
+        let mut observed = activate_direct_adapter(&mut adapter, &handle, 6).await;
         loop {
             let read = adapter.read(&mut output).await.unwrap();
             if read == 0 {
@@ -510,7 +529,7 @@ async fn raw_fetch_after_activation_is_rejected() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         error.to_string(),
-        "UIDONLY IMAP response read or parse failed"
+        "UIDONLY adapter rejected forbidden response shape"
     );
     assert!(handle
         .poison_reason()
@@ -619,7 +638,7 @@ async fn oversized_or_over_budget_literal_marker_is_never_forwarded() {
         let (mut adapter, handle) = UidOnlyAdapter::new(io, limits).unwrap();
         handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
 
-        let mut observed = Vec::new();
+        let mut observed = activate_direct_adapter(&mut adapter, &handle, marker).await;
         let error = adapter.read_to_end(&mut observed).await.unwrap_err();
         assert!(error.to_string().contains(expected));
         let marker = format!("{{{marker}}}\r\n");
@@ -627,6 +646,26 @@ async fn oversized_or_over_budget_literal_marker_is_never_forwarded() {
             .windows(marker.len())
             .any(|window| window == marker.as_bytes()));
     }
+}
+
+#[tokio::test]
+async fn per_command_literal_ceiling_rejects_before_accepting_body_octets() {
+    let transcript = fixture_with_after_enable(
+        b"* 42 UIDFETCH (UID 42 RFC822.SIZE 5 BODY[] {5}\r\nhello)\r\nA0003 OK FETCH completed\r\n",
+    );
+    let (session, handle, _) = activated_session(
+        transcript,
+        AdapterLimits::default(),
+        CommandLimits::default(),
+    )
+    .await;
+    let error = session.fetch_body(nz(42), nzs(4)).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(handle.literal_bytes_received(), 0);
+    assert_eq!(
+        handle.poison_reason().as_deref(),
+        Some("literal exceeds configured byte limit")
+    );
 }
 
 #[tokio::test]
@@ -639,7 +678,7 @@ async fn unsupported_and_overflowing_active_literal_markers_fail_before_forwardi
         let (io, _) = ScriptedIo::new(transcript);
         let (mut adapter, handle) = UidOnlyAdapter::new(io, AdapterLimits::default()).unwrap();
         handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
-        let mut observed = Vec::new();
+        let mut observed = activate_direct_adapter(&mut adapter, &handle, 1).await;
         let error = adapter.read_to_end(&mut observed).await.unwrap_err();
         assert!(
             error.to_string().contains("literal"),
@@ -688,7 +727,8 @@ async fn truncated_literal_long_line_and_ambiguous_brace_text_fail_closed() {
         let (io, _) = ScriptedIo::new(transcript);
         let (mut adapter, handle) = UidOnlyAdapter::new(io, limits).unwrap();
         handle.arm_enable(&RequestId("A0009".to_string())).unwrap();
-        let error = adapter.read_to_end(&mut Vec::new()).await.unwrap_err();
+        let mut observed = activate_direct_adapter(&mut adapter, &handle, 5).await;
+        let error = adapter.read_to_end(&mut observed).await.unwrap_err();
         assert!(error.to_string().contains(expected));
         assert_eq!(error.kind(), expected_kind);
     }
@@ -786,19 +826,20 @@ async fn inventory_rejects_uid_mismatch_missing_items_and_overfull_page() {
         let surface = error.to_string();
         assert!(
             surface.contains(expected_adapter_invariant)
-                || surface == "UIDONLY IMAP response read or parse failed",
+                || surface == "UIDONLY IMAP response read or parse failed"
+                || surface == "UIDONLY adapter rejected forbidden response shape",
             "unexpected safe error surface: {surface}"
         );
     }
 }
 
 #[tokio::test]
-async fn exact_body_chunk_returns_literal_and_rejects_adjacent_uid_or_wrong_origin() {
+async fn exact_body_returns_complete_literal_and_rejects_adjacent_uid_or_partial_origin() {
     let raw = b"synthetic raw bytes\r\n";
+    let advisory_size = raw.len() as u32 + 2;
     let transcript = fixture_with_after_enable(
         format!(
-            "* 42 UIDFETCH (UID 42 RFC822.SIZE {} BODY[]<0> {{{}}}\r\n{})\r\nA0003 OK FETCH completed\r\n",
-            raw.len(),
+            "* 42 UIDFETCH (UID 42 RFC822.SIZE {advisory_size} BODY[] {{{}}}\r\n{})\r\nA0003 OK FETCH completed\r\n",
             raw.len(),
             String::from_utf8_lossy(raw)
         )
@@ -810,48 +851,33 @@ async fn exact_body_chunk_returns_literal_and_rejects_adjacent_uid_or_wrong_orig
         CommandLimits::default(),
     )
     .await;
-    let (_session, result) = session
-        .fetch_body_chunk(nz(42), 0, nz(1_024))
-        .await
-        .unwrap();
+    let (_session, result) = session.fetch_body(nz(42), nzs(1_024)).await.unwrap();
     assert_eq!(
         result,
-        ExactFetchOutcome::Chunk(BodyChunk {
+        ExactFetchOutcome::Message(ExactBody {
             uid: nz(42),
-            rfc822_size: raw.len() as u32,
-            offset: 0,
+            rfc822_size: advisory_size,
             bytes: raw.to_vec(),
             notifications: Vec::new(),
         })
     );
     let written =
         String::from_utf8(written.lock().expect("written mutex poisoned").clone()).unwrap();
-    assert!(written
-        .contains("A0003 UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[]<0.1024>) (PARTIAL 1:1)\r\n"));
+    assert!(written.contains("A0003 UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[])\r\n"));
 
     for (response, expected) in [
         (
-            b"* 43 UIDFETCH (UID 43 RFC822.SIZE 1 BODY[]<0> {1}\r\nx)\r\nA0003 OK FETCH completed\r\n"
+            b"* 43 UIDFETCH (UID 43 RFC822.SIZE 1 BODY[] {1}\r\nx)\r\nA0003 OK FETCH completed\r\n"
                 .as_slice(),
             "exact requested UID",
         ),
         (
             b"* 42 UIDFETCH (UID 42 RFC822.SIZE 1 BODY[]<1> {1}\r\nx)\r\nA0003 OK FETCH completed\r\n"
                 .as_slice(),
-            "origin does not match",
+            "complete message",
         ),
         (
-            b"* 42 UIDFETCH (UID 42 RFC822.SIZE 1 BODY[] {1}\r\nx)\r\nA0003 OK FETCH completed\r\n"
-                .as_slice(),
-            "origin does not match",
-        ),
-        (
-            b"* 42 UIDFETCH (UID 42 RFC822.SIZE 10 BODY[]<0> {0}\r\n)\r\nA0003 OK FETCH completed\r\n"
-                .as_slice(),
-            "literal length is inconsistent",
-        ),
-        (
-            b"* 42 UIDFETCH (UID 42 RFC822.SIZE 1 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\" BODY[]<0> {1}\r\nx)\r\nA0003 OK FETCH completed\r\n"
+            b"* 42 UIDFETCH (UID 42 RFC822.SIZE 1 INTERNALDATE \"01-Jan-2020 00:00:00 +0000\" BODY[] {1}\r\nx)\r\nA0003 OK FETCH completed\r\n"
                 .as_slice(),
             "unrequested attribute",
         ),
@@ -863,10 +889,7 @@ async fn exact_body_chunk_returns_literal_and_rejects_adjacent_uid_or_wrong_orig
             CommandLimits::default(),
         )
         .await;
-        let error = session
-            .fetch_body_chunk(nz(42), 0, nz(1))
-            .await
-            .unwrap_err();
+        let error = session.fetch_body(nz(42), nzs(1)).await.unwrap_err();
         assert!(error.to_string().contains(expected));
     }
 }
@@ -889,10 +912,7 @@ async fn tagged_command_rejections_preserve_only_the_safe_status_class() {
             CommandLimits::default(),
         )
         .await;
-        let error = session
-            .fetch_body_chunk(nz(42), 0, nz(1))
-            .await
-            .unwrap_err();
+        let error = session.fetch_body(nz(42), nzs(1)).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), expected);
         assert!(!error.to_string().contains("private provider detail"));
@@ -918,10 +938,7 @@ async fn unparseable_tagged_status_never_bypasses_tag_or_ok_validation() {
             CommandLimits::default(),
         )
         .await;
-        let error = session
-            .fetch_body_chunk(nz(42), 0, nz(1))
-            .await
-            .unwrap_err();
+        let error = session.fetch_body(nz(42), nzs(1)).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), expected);
         assert!(!error.to_string().contains("private provider detail"));
@@ -933,7 +950,7 @@ async fn literal_meter_charges_body_octets_before_truncated_command_completion()
     let raw = b"received before eof";
     let transcript = fixture_with_after_enable(
         format!(
-            "* 42 UIDFETCH (UID 42 RFC822.SIZE {} BODY[]<0> {{{}}}\r\n{})\r\n",
+            "* 42 UIDFETCH (UID 42 RFC822.SIZE {} BODY[] {{{}}}\r\n{})\r\n",
             raw.len(),
             raw.len(),
             String::from_utf8_lossy(raw)
@@ -948,7 +965,7 @@ async fn literal_meter_charges_body_octets_before_truncated_command_completion()
     .await;
     let before = handle.literal_bytes_received();
     let error = session
-        .fetch_body_chunk(nz(42), 0, nz(raw.len() as u32))
+        .fetch_body(nz(42), nzs(raw.len()))
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
@@ -958,7 +975,7 @@ async fn literal_meter_charges_body_octets_before_truncated_command_completion()
 #[tokio::test]
 async fn parser_failures_do_not_echo_literal_bytes() {
     let transcript = fixture_with_after_enable(
-        b"* 42 UIDFETCH (UID 42 RFC822.SIZE 6 BODY[]<0> {6}\r\nSECRET BROKEN\r\n",
+        b"* 42 UIDFETCH (UID 42 RFC822.SIZE 6 BODY[] {6}\r\nSECRET BROKEN\r\n",
     );
     let (session, _, _) = activated_session(
         transcript,
@@ -966,10 +983,7 @@ async fn parser_failures_do_not_echo_literal_bytes() {
         CommandLimits::default(),
     )
     .await;
-    let error = session
-        .fetch_body_chunk(nz(42), 0, nz(6))
-        .await
-        .unwrap_err();
+    let error = session.fetch_body(nz(42), nzs(6)).await.unwrap_err();
     assert_eq!(
         error.to_string(),
         "UIDONLY IMAP response read or parse failed"
@@ -993,7 +1007,7 @@ async fn exact_body_fetch_distinguishes_missing_and_vanished() {
             CommandLimits::default(),
         )
         .await;
-        let (_session, outcome) = session.fetch_body_chunk(nz(42), 0, nz(1)).await.unwrap();
+        let (_session, outcome) = session.fetch_body(nz(42), nzs(1)).await.unwrap();
         assert_eq!(
             matches!(outcome, ExactFetchOutcome::Vanished { .. }),
             expected_vanished
@@ -1192,14 +1206,13 @@ fn typed_command_builder_quotes_mailbox_and_rejects_injection() {
         "UID FETCH 1:50000 (UID RFC822.SIZE INTERNALDATE) (PARTIAL 1:1000)"
     );
     assert_eq!(
-        UidOnlyCommand::BodyChunk {
+        UidOnlyCommand::Body {
             uid: nz(42),
-            offset: 1_024,
-            count: nz(4_096),
+            max_literal_bytes: nzs(4_096),
         }
         .render(&limits)
         .unwrap(),
-        "UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[]<1024.4096>) (PARTIAL 1:1)"
+        "UID FETCH 42 (UID RFC822.SIZE BODY.PEEK[])"
     );
 }
 
@@ -1309,7 +1322,7 @@ async fn loopback_fake_server_observes_exact_read_only_command_order() {
                 )
             } else if command.contains("UID FETCH 7 ") {
                 format!(
-                    "* 7 UIDFETCH (UID 7 RFC822.SIZE 5 BODY[]<0> {{5}}\r\nhello)\r\n{tag} OK FETCH completed\r\n"
+                    "* 7 UIDFETCH (UID 7 RFC822.SIZE 5 BODY[] {{5}}\r\nhello)\r\n{tag} OK FETCH completed\r\n"
                 )
             } else if command.contains(" LOGOUT") {
                 format!("* BYE logout\r\n{tag} OK LOGOUT completed\r\n")
@@ -1342,10 +1355,10 @@ async fn loopback_fake_server_observes_exact_read_only_command_order() {
         .await
         .unwrap();
     assert_eq!(page.items[0].uid, nz(7));
-    let (session, body) = session.fetch_body_chunk(nz(7), 0, nz(5)).await.unwrap();
+    let (session, body) = session.fetch_body(nz(7), nzs(5)).await.unwrap();
     assert!(matches!(
         body,
-        ExactFetchOutcome::Chunk(BodyChunk { ref bytes, .. }) if bytes == b"hello"
+        ExactFetchOutcome::Message(ExactBody { ref bytes, .. }) if bytes == b"hello"
     ));
     session.logout().await.unwrap();
     server.await.unwrap();

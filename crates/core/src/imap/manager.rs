@@ -429,7 +429,7 @@ impl ImapConnectionManager {
         ) {
             AcquisitionRoute::Standard => {
                 // The probe uses UIDONLY's bounded response adapter, whose
-                // literal ceiling is intentionally one body chunk. Preserve
+                // literal ceiling is acquisition-specific. Preserve
                 // the legacy provider path on a fresh, unwrapped connection,
                 // but build it from the same immutable account snapshot so a
                 // concurrent config edit cannot redirect credentials.

@@ -45,6 +45,45 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn safe_adapter_failure(reason: &str) -> Option<&'static str> {
+    match reason {
+        "response byte count overflow"
+        | "response exceeds configured byte limit"
+        | "literal byte count does not fit u64"
+        | "literal byte counter overflow"
+        | "literal exceeds configured byte limit"
+        | "announced literal exceeds remaining response budget"
+        | "input buffer limit reached" => Some("UIDONLY adapter resource ceiling exceeded"),
+        "control line exceeds configured byte limit" => {
+            Some("UIDONLY adapter control-line ceiling exceeded")
+        }
+        "truncated IMAP response" => Some("UIDONLY adapter response was truncated"),
+        "invalid literal marker"
+        | "literal8 is unsupported"
+        | "invalid pass-through literal marker"
+        | "pass-through literal length overflow" => {
+            Some("UIDONLY adapter rejected literal framing")
+        }
+        "UIDFETCH INTERNALDATE NIL is invalid"
+        | "literal-like marker outside an active UIDFETCH response"
+        | "literal response is forbidden during UIDONLY activation"
+        | "UIDFETCH arrived before UIDONLY activation"
+        | "raw FETCH is forbidden after UIDONLY activation" => {
+            Some("UIDONLY adapter rejected forbidden response shape")
+        }
+        "missing reserved provenance slot"
+        | "missing active response classification"
+        | "tagged completion arrived outside a command"
+        | "literal arrived outside an active command" => {
+            Some("UIDONLY adapter provenance invariant failed")
+        }
+        "ENABLE UIDONLY wire byte count overflow"
+        | "ENABLE completed OK without ENABLED UIDONLY"
+        | "ENABLE UIDONLY was rejected" => Some("UIDONLY adapter activation failed"),
+        _ => None,
+    }
+}
+
 /// Resource ceilings enforced before bytes reach `imap-proto`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterLimits {
@@ -91,7 +130,7 @@ pub struct CommandLimits {
     pub max_events: NonZeroUsize,
     pub max_vanished_ranges: NonZeroUsize,
     pub max_inventory_page: NonZeroU32,
-    pub max_body_chunk_bytes: NonZeroU32,
+    pub max_body_literal_bytes: NonZeroUsize,
     pub max_mailbox_wire_bytes: NonZeroUsize,
 }
 
@@ -104,7 +143,7 @@ impl Default for CommandLimits {
             max_events: NonZeroUsize::new(2_048).expect("constant is nonzero"),
             max_vanished_ranges: NonZeroUsize::new(2_048).expect("constant is nonzero"),
             max_inventory_page: NonZeroU32::new(1_000).expect("constant is nonzero"),
-            max_body_chunk_bytes: NonZeroU32::new(1024 * 1024).expect("constant is nonzero"),
+            max_body_literal_bytes: NonZeroUsize::new(1024 * 1024).expect("constant is nonzero"),
             max_mailbox_wire_bytes: NonZeroUsize::new(4_096).expect("constant is nonzero"),
         }
     }
@@ -163,6 +202,7 @@ enum Mode {
 #[derive(Debug)]
 struct SharedState {
     mode: Mode,
+    active_command: Option<ActiveCommand>,
     provenance: VecDeque<Provenance>,
     reserved: usize,
     provenance_capacity: usize,
@@ -170,6 +210,12 @@ struct SharedState {
     literal_bytes_received: u64,
     poison_reason: Option<String>,
     waker: AtomicWaker,
+}
+
+#[derive(Debug)]
+struct ActiveCommand {
+    tag: Vec<u8>,
+    max_literal_bytes: usize,
 }
 
 /// Control handle paired with one [`UidOnlyAdapter`].
@@ -203,6 +249,20 @@ impl AdapterHandle {
             shared.waker.wake();
         }
         result
+    }
+
+    fn arm_command(&self, request_id: &RequestId, max_literal_bytes: usize) -> io::Result<()> {
+        let mut shared = self.shared.lock().expect("adapter mutex poisoned");
+        if !matches!(shared.mode, Mode::Active) || shared.active_command.is_some() {
+            return Err(io::Error::other(
+                "UIDONLY command requires an idle active adapter",
+            ));
+        }
+        shared.active_command = Some(ActiveCommand {
+            tag: request_id.as_bytes().to_vec(),
+            max_literal_bytes,
+        });
+        Ok(())
     }
 
     fn provenance_len(&self) -> usize {
@@ -294,6 +354,7 @@ impl<T> UidOnlyAdapter<T> {
         limits.validate()?;
         let shared = Arc::new(Mutex::new(SharedState {
             mode: Mode::PassThrough,
+            active_command: None,
             provenance: VecDeque::new(),
             reserved: 0,
             provenance_capacity: limits.provenance_capacity.get(),
@@ -336,6 +397,7 @@ impl<T> UidOnlyAdapter<T> {
         if !matches!(shared.mode, Mode::PassThrough)
             || !shared.provenance.is_empty()
             || shared.reserved != 0
+            || shared.active_command.is_some()
             || !self.input.is_empty()
             || !self.emit.is_empty()
             || !self.line.is_empty()
@@ -466,7 +528,24 @@ impl<T> UidOnlyAdapter<T> {
         };
 
         if let Some(length) = literal {
-            if length > self.limits.max_literal_bytes.get() {
+            let active_command_limit = if matches!(mode, Mode::Active) {
+                let limit = self
+                    .shared
+                    .lock()
+                    .expect("adapter mutex poisoned")
+                    .active_command
+                    .as_ref()
+                    .map(|command| command.max_literal_bytes);
+                let Some(limit) = limit else {
+                    return Err(self.poison("literal arrived outside an active command"));
+                };
+                Some(limit)
+            } else {
+                None
+            };
+            if length > self.limits.max_literal_bytes.get()
+                || active_command_limit.is_some_and(|limit| length > limit)
+            {
                 return Err(self.poison("literal exceeds configured byte limit"));
             }
             let projected_response_bytes = self
@@ -618,6 +697,15 @@ impl<T> UidOnlyAdapter<T> {
                         return Err(self.poison("missing active response classification"));
                     }
                 };
+                if let Provenance::TaggedCompletion { tag, .. } = &record {
+                    let Some(command) = shared.active_command.as_ref() else {
+                        drop(shared);
+                        return Err(self.poison("tagged completion arrived outside a command"));
+                    };
+                    if command.tag == *tag {
+                        shared.active_command = None;
+                    }
+                }
                 shared.reserved -= 1;
                 shared.provenance.push_back(record);
                 self.reserved_provenance = false;
@@ -1057,10 +1145,9 @@ enum UidOnlyCommand {
         encoded_mailbox: String,
     },
     Inventory(InventoryRequest),
-    BodyChunk {
+    Body {
         uid: NonZeroU32,
-        offset: u32,
-        count: NonZeroU32,
+        max_literal_bytes: NonZeroUsize,
     },
     Noop,
     Logout,
@@ -1119,22 +1206,20 @@ impl UidOnlyCommand {
                     request.start, request.end, request.page_size
                 ))
             }
-            Self::BodyChunk { uid, offset, count } => {
-                if count > &limits.max_body_chunk_bytes {
+            // A single exact UID already bounds this command to at most one
+            // result. Yahoo has demonstrated full BODY.PEEK[] interoperability,
+            // while its partial body-section octet contract is not reliable.
+            Self::Body {
+                uid,
+                max_literal_bytes,
+            } => {
+                if max_literal_bytes > &limits.max_body_literal_bytes {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "body chunk exceeds configured limit",
+                        "body literal ceiling exceeds configured limit",
                     ));
                 }
-                offset.checked_add(count.get()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "body chunk range overflows")
-                })?;
-                // Keep an explicit one-result bound on exact-UID body reads. Some
-                // UIDONLY servers require the PARTIAL result modifier on FETCH.
-                Ok(format!(
-                    "UID FETCH {} (UID RFC822.SIZE BODY.PEEK[]<{}.{}>) (PARTIAL 1:1)",
-                    uid, offset, count
-                ))
+                Ok(format!("UID FETCH {} (UID RFC822.SIZE BODY.PEEK[])", uid))
             }
             Self::Noop => Ok("NOOP".to_string()),
             Self::Logout => Ok("LOGOUT".to_string()),
@@ -1184,12 +1269,11 @@ pub struct InventoryPage {
     pub notifications: Vec<Notification>,
 }
 
-/// Exact raw body chunk returned for one UID.
+/// Exact raw message returned for one UID.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BodyChunk {
+pub struct ExactBody {
     pub uid: NonZeroU32,
     pub rfc822_size: u32,
-    pub offset: u32,
     pub bytes: Vec<u8>,
     pub notifications: Vec<Notification>,
 }
@@ -1197,7 +1281,7 @@ pub struct BodyChunk {
 /// Explicit result for an exact-UID body command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExactFetchOutcome {
-    Chunk(BodyChunk),
+    Message(ExactBody),
     Missing {
         uid: NonZeroU32,
         notifications: Vec<Notification>,
@@ -1214,7 +1298,6 @@ enum Solicited {
     Body {
         uid: NonZeroU32,
         rfc822_size: u32,
-        offset: u32,
         bytes: Vec<u8>,
     },
 }
@@ -1348,14 +1431,16 @@ where
         Ok((session, page))
     }
 
-    /// Fetches one bounded raw-message octet chunk by one exact UID.
-    pub async fn fetch_body_chunk(
+    /// Fetches one bounded complete raw message by one exact UID.
+    pub async fn fetch_body(
         self,
         uid: NonZeroU32,
-        offset: u32,
-        count: NonZeroU32,
+        max_literal_bytes: NonZeroUsize,
     ) -> io::Result<(Self, ExactFetchOutcome)> {
-        let command = UidOnlyCommand::BodyChunk { uid, offset, count };
+        let command = UidOnlyCommand::Body {
+            uid,
+            max_literal_bytes,
+        };
         let (session, output) = self.execute(command).await?;
         let CommandOutput::Body(outcome) = output else {
             unreachable!("command and output variants are paired");
@@ -1398,6 +1483,13 @@ where
             .run_command(rendered)
             .await
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let max_literal_bytes = match command {
+            UidOnlyCommand::Body {
+                max_literal_bytes, ..
+            } => max_literal_bytes.get(),
+            _ => 0,
+        };
+        self.handle.arm_command(&request_id, max_literal_bytes)?;
         let mut accumulator = Accumulator::default();
         let mut response_count = 0_usize;
         let mut command_wire_bytes = 0_usize;
@@ -1418,6 +1510,14 @@ where
                         .and_then(|provenance| tagged_parse_failure(&provenance, &request_id))
                     {
                         return Err(invalid_data(message));
+                    }
+                    if let Some(message) = self
+                        .handle
+                        .poison_reason()
+                        .as_deref()
+                        .and_then(safe_adapter_failure)
+                    {
+                        return Err(io::Error::new(error.kind(), message));
                     }
                     return Err(io::Error::new(
                         error.kind(),
@@ -1808,7 +1908,7 @@ fn classify_uidfetch(
                     internal_date: internal_dates[0].clone(),
                 }));
         }
-        UidOnlyCommand::BodyChunk { uid, offset, count } => {
+        UidOnlyCommand::Body { uid, .. } => {
             if attributes.iter().any(|attribute| {
                 !matches!(
                     attribute,
@@ -1832,27 +1932,20 @@ fn classify_uidfetch(
                 ));
             }
             let (section, returned_offset, data) = body_sections[0];
-            if section.is_some() || returned_offset != &Some(*offset) {
+            if section.is_some() || returned_offset.is_some() {
                 return Err(invalid_data(
-                    "body section origin does not match requested full-message chunk",
+                    "body response is not the requested complete message",
                 ));
             }
             let bytes = data
                 .as_ref()
                 .ok_or_else(|| invalid_data("body response omitted literal data"))?;
-            let remaining = size[0]
-                .checked_sub(*offset)
-                .ok_or_else(|| invalid_data("body response offset exceeds RFC822.SIZE"))?;
-            let expected = remaining.min(count.get()) as usize;
-            if bytes.len() != expected {
-                return Err(invalid_data(
-                    "body literal length is inconsistent with request and RFC822.SIZE",
-                ));
-            }
+            // RFC822.SIZE remains useful advisory metadata, but Yahoo has
+            // returned complete raw literals whose octet count differs from it.
+            // Literal framing, not RFC822.SIZE equality, proves completeness.
             accumulator.solicited.push(Solicited::Body {
                 uid: leading_uid,
                 rfc822_size: size[0],
-                offset: *offset,
                 bytes: bytes.to_vec(),
             });
         }
@@ -1938,7 +2031,7 @@ fn finalize_command(
                 notifications: accumulator.notifications,
             }))
         }
-        UidOnlyCommand::BodyChunk { uid, .. } => {
+        UidOnlyCommand::Body { uid, .. } => {
             if accumulator.solicited.len() > 1 {
                 return Err(invalid_data(
                     "body command returned more than one solicited result",
@@ -1955,7 +2048,6 @@ fn finalize_command(
                 Some(Solicited::Body {
                     uid,
                     rfc822_size,
-                    offset,
                     bytes,
                 }) => {
                     if vanished {
@@ -1963,10 +2055,9 @@ fn finalize_command(
                             "body result and target VANISHED were both reported",
                         ));
                     }
-                    Ok(CommandOutput::Body(ExactFetchOutcome::Chunk(BodyChunk {
+                    Ok(CommandOutput::Body(ExactFetchOutcome::Message(ExactBody {
                         uid,
                         rfc822_size,
-                        offset,
                         bytes,
                         notifications: accumulator.notifications,
                     })))

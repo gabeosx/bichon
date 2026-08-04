@@ -26,5 +26,8 @@ pub mod session;
 pub mod stats;
 #[cfg(test)]
 mod tests;
+pub(crate) mod uidonly;
+#[cfg(test)]
+mod uidonly_tests;
 #[cfg(test)]
 pub mod mock_server;

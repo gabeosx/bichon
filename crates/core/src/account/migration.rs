@@ -39,7 +39,7 @@ use crate::{
     id,
     oauth2::token::OAuth2AccessToken,
     raise_error,
-    store::tantivy::{attachment::ATTACHMENT_MANAGER, envelope::ENVELOPE_MANAGER},
+    store::tantivy::envelope::ENVELOPE_MANAGER,
     users::{payload::UserUpdateRequest, role::DEFAULT_ACCOUNT_MANAGER_ROLE_ID, UserModel},
     utc_now,
 };
@@ -501,9 +501,6 @@ impl Account {
         MailBox::clean(account.id)?;
         ENVELOPE_MANAGER
             .delete_account_envelopes(account.id)
-            .await?;
-        ATTACHMENT_MANAGER
-            .delete_account_attachments(account.id)
             .await?;
         Self::delete_account(account)?;
         info!("Sequential cleanup completed for account: {}", account.id);

@@ -32,19 +32,22 @@ use crate::envelope::extractor::{
 };
 use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
-use crate::imap::executor::DEFAULT_MAX_EMAIL_SIZE;
+use crate::imap::executor::{DEFAULT_BATCH_SIZE, DEFAULT_MAX_EMAIL_SIZE};
 use crate::imap::manager::ImapConnectionManager;
 use crate::imap::session::SessionStream;
 use crate::imap::uidonly::{exact_args, inventory_args, UidOnlyHandle, UidOnlyLimits};
 use crate::raise_error;
 use async_imap::Session;
 use futures::{FutureExt, TryStreamExt};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const UIDONLY_DEFAULT_PAGE_SIZE: u32 = 1_000;
+const UIDONLY_MAX_FETCH_BATCH_MESSAGES: u32 = 32;
+const UIDONLY_FETCH_BATCH_BYTES: u64 = UIDONLY_PROJECTION_BATCH_BYTES as u64;
 const MAX_UIDONLY_RECONNECTS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +55,8 @@ pub(crate) struct AcquisitionLimits {
     pub max_literal_bytes: u64,
     pub max_operation_runtime: Duration,
     pub page_size: u32,
+    pub fetch_batch_size: u32,
+    pub fetch_batch_bytes: u64,
 }
 
 impl AcquisitionLimits {
@@ -62,6 +67,8 @@ impl AcquisitionLimits {
             // archive: a valid large mailbox may need to run for days.
             max_operation_runtime: Duration::from_secs(10 * 60),
             page_size: 1_000,
+            fetch_batch_size: DEFAULT_BATCH_SIZE.min(UIDONLY_MAX_FETCH_BATCH_MESSAGES),
+            fetch_batch_bytes: UIDONLY_FETCH_BATCH_BYTES,
         }
     }
 
@@ -69,6 +76,10 @@ impl AcquisitionLimits {
         if self.max_literal_bytes == 0
             || self.max_operation_runtime.is_zero()
             || self.page_size == 0
+            || self.fetch_batch_size == 0
+            || self.fetch_batch_size > UIDONLY_MAX_FETCH_BATCH_MESSAGES
+            || self.fetch_batch_bytes == 0
+            || self.fetch_batch_bytes > UIDONLY_FETCH_BATCH_BYTES
         {
             return Err(raise_error!(
                 "UIDONLY acquisition limits must be nonzero".into(),
@@ -89,6 +100,7 @@ pub(crate) struct MailboxSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InventoryItem {
     pub uid: u32,
+    pub rfc822_size: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,9 +131,14 @@ pub(crate) trait UidOnlyTransport {
         page_size: u32,
     ) -> BichonResult<Vec<InventoryItem>>;
 
-    /// Fetch exactly one full message. `literal_budget` is a pre-read ceiling,
-    /// not a post-read accounting hint.
-    async fn fetch_exact(&mut self, uid: u32, literal_budget: u64) -> BichonResult<UidOnlyMessage>;
+    /// Fetch one exact, bounded UID set. The count and aggregate byte budget
+    /// are pre-read ceilings, not post-read accounting hints.
+    async fn fetch_many(
+        &mut self,
+        items: &[InventoryItem],
+        literal_budget: u64,
+        command_budget: u64,
+    ) -> BichonResult<Vec<UidOnlyMessage>>;
 
     async fn reconnect(&mut self, _page_size: u32) -> BichonResult<()> {
         Err(raise_error!(
@@ -260,18 +277,20 @@ async fn inventory_with_reconnect<T: UidOnlyTransport>(
     }
 }
 
-async fn fetch_with_reconnect<T: UidOnlyTransport>(
+async fn fetch_batch_with_reconnect<T: UidOnlyTransport>(
     transport: &mut T,
     mailbox: &str,
     initial: MailboxSnapshot,
-    uid: u32,
+    items: Vec<InventoryItem>,
     limits: AcquisitionLimits,
     token: &CancellationToken,
-) -> BichonResult<UidOnlyMessage> {
+) -> BichonResult<Vec<UidOnlyMessage>> {
     let mut reconnects = 0;
-    loop {
+    let mut pending = VecDeque::from([items]);
+    let mut messages = Vec::new();
+    while let Some(batch) = pending.pop_front() {
         match bounded(
-            transport.fetch_exact(uid, limits.max_literal_bytes),
+            transport.fetch_many(&batch, limits.max_literal_bytes, limits.fetch_batch_bytes),
             limits.max_operation_runtime,
             token,
         )
@@ -280,10 +299,53 @@ async fn fetch_with_reconnect<T: UidOnlyTransport>(
             Err(error) if retryable_transport_error(error.code()) => {
                 recover_transport(transport, mailbox, initial, limits, token, &mut reconnects)
                     .await?;
+                pending.push_front(batch);
             }
-            result => return result,
+            Err(error) if error.code() == ErrorCode::PayloadTooLarge && batch.len() > 1 => {
+                recover_transport(transport, mailbox, initial, limits, token, &mut reconnects)
+                    .await?;
+                let midpoint = batch.len() / 2;
+                pending.push_front(batch[midpoint..].to_vec());
+                pending.push_front(batch[..midpoint].to_vec());
+            }
+            Err(error) => return Err(error),
+            Ok(batch_messages) => messages.extend(batch_messages),
         }
     }
+    Ok(messages)
+}
+
+fn planned_fetch_batches(
+    items: Vec<InventoryItem>,
+    count_limit: u32,
+    byte_limit: u64,
+) -> Vec<Vec<InventoryItem>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut bytes = 0_u64;
+    for item in items {
+        let declared = item.rfc822_size.max(1);
+        if !batch.is_empty()
+            && (batch.len() >= count_limit as usize || bytes.saturating_add(declared) > byte_limit)
+        {
+            batches.push(std::mem::take(&mut batch));
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(declared);
+        batch.push(item);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+fn effective_fetch_batch_size(requested: Option<u32>, message_limit: u32) -> u32 {
+    requested
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+        .min(message_limit)
+        .min(UIDONLY_MAX_FETCH_BATCH_MESSAGES)
+        .max(1)
 }
 
 async fn snapshot_with_reconnect<T: UidOnlyTransport>(
@@ -439,39 +501,63 @@ where
             ));
         }
 
+        let mut unresolved = Vec::new();
         for (item, is_verified) in page.into_iter().zip(verified) {
             if is_verified {
                 archived += 1;
-                continue;
+            } else {
+                unresolved.push(item);
             }
+        }
 
-            let message =
-                fetch_with_reconnect(transport, mailbox, snapshot, item.uid, limits, &token)
+        for batch in planned_fetch_batches(
+            unresolved,
+            limits.fetch_batch_size,
+            limits.fetch_batch_bytes,
+        ) {
+            let requested = batch.clone();
+            let messages =
+                fetch_batch_with_reconnect(transport, mailbox, snapshot, batch, limits, &token)
                     .await?;
-            if message.uid != item.uid {
+            if messages.len() != requested.len() {
                 return Err(raise_error!(
-                    "UIDONLY exact fetch returned the wrong UID".into(),
+                    "UIDONLY body batch returned the wrong result count".into(),
                     ErrorCode::ImapUnexpectedResult
                 ));
             }
-            let actual = message.body.len() as u64;
-            if actual > limits.max_literal_bytes {
-                return Err(raise_error!(
-                    "UIDONLY exact body exceeded its pre-read budget".into(),
-                    ErrorCode::PayloadTooLarge
-                ));
+            for (item, message) in requested.into_iter().zip(messages) {
+                if message.uid != item.uid {
+                    return Err(raise_error!(
+                        "UIDONLY exact fetch returned the wrong UID".into(),
+                        ErrorCode::ImapUnexpectedResult
+                    ));
+                }
+                let actual = message.body.len() as u64;
+                if actual > limits.max_literal_bytes {
+                    return Err(raise_error!(
+                        "UIDONLY exact body exceeded its pre-read budget".into(),
+                        ErrorCode::PayloadTooLarge
+                    ));
+                }
+                if !pending.is_empty()
+                    && (pending.len() >= UIDONLY_PROJECTION_BATCH_MESSAGES
+                        || pending_bytes.saturating_add(actual)
+                            > UIDONLY_PROJECTION_BATCH_BYTES as u64)
+                {
+                    let stored =
+                        flush_projection_batch(archive, &mut pending, limits, &token).await?;
+                    archived += stored;
+                    downloaded += stored;
+                    pending_bytes = 0;
+                    progress(AcquisitionProgress {
+                        planned,
+                        resolved: archived,
+                        downloaded,
+                    })?;
+                }
+                pending_bytes += actual;
+                pending.push(message);
             }
-            if !pending.is_empty()
-                && (pending.len() >= UIDONLY_PROJECTION_BATCH_MESSAGES
-                    || pending_bytes.saturating_add(actual) > UIDONLY_PROJECTION_BATCH_BYTES as u64)
-            {
-                let stored = flush_projection_batch(archive, &mut pending, limits, &token).await?;
-                archived += stored;
-                downloaded += stored;
-                pending_bytes = 0;
-            }
-            pending_bytes += actual;
-            pending.push(message);
         }
 
         let stored = flush_projection_batch(archive, &mut pending, limits, &token).await?;
@@ -482,7 +568,7 @@ where
         cursor = previous.checked_add(1).unwrap_or(u32::MAX);
         progress(AcquisitionProgress {
             planned,
-            resolved: inventoried,
+            resolved: archived,
             downloaded,
         })?;
         if previous == u32::MAX {
@@ -688,7 +774,8 @@ fn protocol_limits(max_literal_bytes: u64) -> BichonResult<UidOnlyLimits> {
             ErrorCode::InvalidParameter
         )
     })?;
-    let response = literal.checked_add(128 * 1024).ok_or_else(|| {
+    let command_literal = literal.max(UIDONLY_FETCH_BATCH_BYTES as usize);
+    let response = command_literal.checked_add(128 * 1024).ok_or_else(|| {
         raise_error!(
             "UIDONLY response-size limit overflow".into(),
             ErrorCode::InvalidParameter
@@ -704,7 +791,7 @@ fn protocol_limits(max_literal_bytes: u64) -> BichonResult<UidOnlyLimits> {
         max_control_line_bytes: 64 * 1024,
         max_literal_bytes: literal,
         max_response_bytes: response,
-        max_command_literal_bytes: literal,
+        max_command_literal_bytes: command_literal,
         max_command_response_bytes: command,
         // A 1,000-message inventory page plus bounded unsolicited mailbox
         // updates must still fit without making the response count unbounded.
@@ -875,21 +962,29 @@ impl UidOnlyTransport for SessionUidOnlyTransport {
                         ErrorCode::ImapUnexpectedResult
                     ));
                 }
-                fetch.size.ok_or_else(|| {
+                let rfc822_size = fetch.size.ok_or_else(|| {
                     raise_error!(
                         "UIDONLY inventory omitted RFC822.SIZE".into(),
                         ErrorCode::ImapUnexpectedResult
                     )
                 })?;
-                Ok(InventoryItem { uid })
+                Ok(InventoryItem {
+                    uid,
+                    rfc822_size: u64::from(rfc822_size),
+                })
             })
             .collect()
     }
 
-    async fn fetch_exact(&mut self, uid: u32, literal_budget: u64) -> BichonResult<UidOnlyMessage> {
-        let limit = usize::try_from(literal_budget).map_err(|_| {
+    async fn fetch_many(
+        &mut self,
+        items: &[InventoryItem],
+        literal_budget: u64,
+        command_budget: u64,
+    ) -> BichonResult<Vec<UidOnlyMessage>> {
+        let limit = usize::try_from(command_budget).map_err(|_| {
             raise_error!(
-                "UIDONLY literal budget is not representable".into(),
+                "UIDONLY command budget is not representable".into(),
                 ErrorCode::InvalidParameter
             )
         })?;
@@ -902,43 +997,99 @@ impl UidOnlyTransport for SessionUidOnlyTransport {
                 )
             })?;
         let before = self.handle.literal_bytes_received();
-        let (set, query) = exact_args(uid).map_err(|_| {
+        let uids = items.iter().map(|item| item.uid).collect::<Vec<_>>();
+        let (set, query) = exact_args(&uids).map_err(|_| {
             raise_error!(
-                "Invalid UIDONLY exact UID".into(),
+                "Invalid UIDONLY exact UID set".into(),
                 ErrorCode::InvalidParameter
             )
         })?;
-        let mut fetched = self.collect_fetches(set, query).await?;
-        if fetched.len() != 1 {
+        let fetched = self.collect_fetches(set, query).await?;
+        if fetched.len() != items.len() {
             return Err(raise_error!(
-                "UIDONLY exact fetch did not return exactly one message".into(),
+                "UIDONLY exact fetch returned the wrong result count".into(),
                 ErrorCode::ImapUnexpectedResult
             ));
         }
-        let fetch = fetched.pop().expect("length checked");
-        if fetch.message != uid || fetch.uid != Some(uid) || fetch.size.is_none() {
-            return Err(raise_error!(
-                "UIDONLY exact fetch returned mismatched metadata".into(),
-                ErrorCode::ImapUnexpectedResult
-            ));
+
+        let requested = items
+            .iter()
+            .map(|item| (item.uid, *item))
+            .collect::<BTreeMap<_, _>>();
+        let mut messages = BTreeMap::new();
+        let mut actual_total = 0_u64;
+        for fetch in fetched {
+            let uid = fetch.uid.ok_or_else(|| {
+                raise_error!(
+                    "UIDONLY exact fetch omitted UID".into(),
+                    ErrorCode::ImapUnexpectedResult
+                )
+            })?;
+            if !requested.contains_key(&uid) || fetch.message != uid || fetch.size.is_none() {
+                return Err(raise_error!(
+                    "UIDONLY exact fetch returned mismatched metadata".into(),
+                    ErrorCode::ImapUnexpectedResult
+                ));
+            }
+            let raw = fetch.body().ok_or_else(|| {
+                raise_error!(
+                    "UIDONLY exact fetch omitted its full literal body".into(),
+                    ErrorCode::ImapUnexpectedResult
+                )
+            })?;
+            let actual = raw.len() as u64;
+            if actual > literal_budget {
+                return Err(raise_error!(
+                    "UIDONLY exact body exceeded its per-literal budget".into(),
+                    ErrorCode::PayloadTooLarge
+                ));
+            }
+            actual_total = actual_total.checked_add(actual).ok_or_else(|| {
+                raise_error!(
+                    "UIDONLY exact batch byte count overflow".into(),
+                    ErrorCode::PayloadTooLarge
+                )
+            })?;
+            if actual_total > command_budget {
+                return Err(raise_error!(
+                    "UIDONLY exact batch exceeded its command budget".into(),
+                    ErrorCode::PayloadTooLarge
+                ));
+            }
+            if messages
+                .insert(
+                    uid,
+                    UidOnlyMessage {
+                        uid,
+                        body: raw.to_vec(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(raise_error!(
+                    "UIDONLY exact fetch returned a duplicate UID".into(),
+                    ErrorCode::ImapUnexpectedResult
+                ));
+            }
         }
-        let raw = fetch.body().ok_or_else(|| {
-            raise_error!(
-                "UIDONLY exact fetch omitted its full literal body".into(),
-                ErrorCode::ImapUnexpectedResult
-            )
-        })?;
         let after = self.handle.literal_bytes_received();
-        if after.checked_sub(before) != Some(raw.len() as u64) {
+        if after.checked_sub(before) != Some(actual_total) {
             return Err(raise_error!(
-                "UIDONLY exact body did not match literal accounting".into(),
+                "UIDONLY exact batch did not match literal accounting".into(),
                 ErrorCode::ImapUnexpectedResult
             ));
         }
-        Ok(UidOnlyMessage {
-            uid,
-            body: raw.to_vec(),
-        })
+        items
+            .iter()
+            .map(|item| {
+                messages.remove(&item.uid).ok_or_else(|| {
+                    raise_error!(
+                        "UIDONLY exact batch omitted a requested UID".into(),
+                        ErrorCode::ImapUnexpectedResult
+                    )
+                })
+            })
+            .collect()
     }
 
     async fn reconnect(&mut self, page_size: u32) -> BichonResult<()> {
@@ -1102,6 +1253,8 @@ where
     };
     let mut limits = AcquisitionLimits::bounded(max_literal);
     limits.page_size = UIDONLY_DEFAULT_PAGE_SIZE.min(message_limit).max(1);
+    limits.fetch_batch_size =
+        effective_fetch_batch_size(account.download_batch_size, message_limit);
     let result = run_acquisition(
         &mut transport,
         &mut archive,
@@ -1147,11 +1300,15 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     fn limits() -> AcquisitionLimits {
-        AcquisitionLimits {
-            max_literal_bytes: 64 * 1024,
-            max_operation_runtime: Duration::from_secs(20),
-            page_size: 2,
-        }
+        let mut limits = AcquisitionLimits::bounded(64 * 1024);
+        limits.max_operation_runtime = Duration::from_secs(20);
+        limits.page_size = 2;
+        limits.fetch_batch_size = 1;
+        limits
+    }
+
+    fn inventory_item(uid: u32, rfc822_size: u64) -> InventoryItem {
+        InventoryItem { uid, rfc822_size }
     }
 
     #[test]
@@ -1214,6 +1371,28 @@ mod tests {
     }
 
     #[test]
+    fn fetch_batch_limits_honor_account_server_and_byte_bounds() {
+        assert_eq!(effective_fetch_batch_size(None, 1_000), 30);
+        assert_eq!(effective_fetch_batch_size(Some(8), 1_000), 8);
+        assert_eq!(effective_fetch_batch_size(Some(100), 1_000), 32);
+        assert_eq!(effective_fetch_batch_size(Some(30), 4), 4);
+
+        let items = vec![
+            inventory_item(1, 40),
+            inventory_item(2, 40),
+            inventory_item(3, 10),
+        ];
+        let batches = planned_fetch_batches(items, 2, 64);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.iter().map(|item| item.uid).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [vec![1], vec![2, 3]]
+        );
+    }
+
+    #[test]
     fn source_identity_is_stable_across_connection_policy_changes() {
         let account = AccountModel {
             email: "alice@example.invalid".into(),
@@ -1264,6 +1443,7 @@ mod tests {
         pages: VecDeque<Vec<InventoryItem>>,
         messages: BTreeMap<u32, Vec<u8>>,
         fetched: Vec<u32>,
+        fetch_batches: Vec<Vec<u32>>,
         expected_cursor: Option<u32>,
     }
 
@@ -1280,12 +1460,13 @@ mod tests {
                     uid_next: 51,
                 },
                 pages: VecDeque::from([
-                    vec![InventoryItem { uid: 2 }, InventoryItem { uid: 30 }],
-                    vec![InventoryItem { uid: 50 }],
+                    vec![inventory_item(2, 64), inventory_item(30, 64)],
+                    vec![inventory_item(50, 64)],
                     vec![],
                 ]),
                 messages: BTreeMap::from([(2, body(2)), (30, body(30)), (50, body(50))]),
                 fetched: Vec::new(),
+                fetch_batches: Vec::new(),
                 expected_cursor: None,
             }
         }
@@ -1308,25 +1489,37 @@ mod tests {
             Ok(self.pages.pop_front().unwrap_or_default())
         }
 
-        async fn fetch_exact(
+        async fn fetch_many(
             &mut self,
-            uid: u32,
+            items: &[InventoryItem],
             literal_budget: u64,
-        ) -> BichonResult<UidOnlyMessage> {
-            self.fetched.push(uid);
-            let raw = self.messages.get(&uid).cloned().ok_or_else(|| {
-                raise_error!(
-                    "synthetic missing body".into(),
-                    ErrorCode::ImapUnexpectedResult
-                )
-            })?;
-            if raw.len() as u64 > literal_budget {
-                return Err(raise_error!(
-                    "synthetic literal budget".into(),
-                    ErrorCode::PayloadTooLarge
-                ));
+            command_budget: u64,
+        ) -> BichonResult<Vec<UidOnlyMessage>> {
+            self.fetch_batches
+                .push(items.iter().map(|item| item.uid).collect());
+            let mut total = 0_u64;
+            let mut messages = Vec::new();
+            for item in items {
+                self.fetched.push(item.uid);
+                let raw = self.messages.get(&item.uid).cloned().ok_or_else(|| {
+                    raise_error!(
+                        "synthetic missing body".into(),
+                        ErrorCode::ImapUnexpectedResult
+                    )
+                })?;
+                total += raw.len() as u64;
+                if raw.len() as u64 > literal_budget || total > command_budget {
+                    return Err(raise_error!(
+                        "synthetic literal budget".into(),
+                        ErrorCode::PayloadTooLarge
+                    ));
+                }
+                messages.push(UidOnlyMessage {
+                    uid: item.uid,
+                    body: raw,
+                });
             }
-            Ok(UidOnlyMessage { uid, body: raw })
+            Ok(messages)
         }
     }
 
@@ -1334,10 +1527,12 @@ mod tests {
         inner: FakeTransport,
         inventory_failures: u32,
         fetch_failures: u32,
+        aggregate_overflow_once: bool,
         reconnects: u32,
         inventory_attempts: u32,
         fetch_attempts: Vec<u32>,
         snapshot_after_reconnect: Option<MailboxSnapshot>,
+        message_limit_after_reconnect: Option<u32>,
     }
 
     impl FlakyTransport {
@@ -1346,10 +1541,12 @@ mod tests {
                 inner: FakeTransport::sparse(),
                 inventory_failures: 0,
                 fetch_failures: 0,
+                aggregate_overflow_once: false,
                 reconnects: 0,
                 inventory_attempts: 0,
                 fetch_attempts: Vec::new(),
                 snapshot_after_reconnect: None,
+                message_limit_after_reconnect: None,
             }
         }
     }
@@ -1376,12 +1573,21 @@ mod tests {
             self.inner.inventory_page(cursor, high, page_size).await
         }
 
-        async fn fetch_exact(
+        async fn fetch_many(
             &mut self,
-            uid: u32,
+            items: &[InventoryItem],
             literal_budget: u64,
-        ) -> BichonResult<UidOnlyMessage> {
-            self.fetch_attempts.push(uid);
+            command_budget: u64,
+        ) -> BichonResult<Vec<UidOnlyMessage>> {
+            self.fetch_attempts
+                .extend(items.iter().map(|item| item.uid));
+            if self.aggregate_overflow_once && items.len() > 1 {
+                self.aggregate_overflow_once = false;
+                return Err(raise_error!(
+                    "synthetic aggregate overflow".into(),
+                    ErrorCode::PayloadTooLarge
+                ));
+            }
             if self.fetch_failures > 0 {
                 self.fetch_failures -= 1;
                 return Err(raise_error!(
@@ -1389,11 +1595,23 @@ mod tests {
                     ErrorCode::NetworkError
                 ));
             }
-            self.inner.fetch_exact(uid, literal_budget).await
+            self.inner
+                .fetch_many(items, literal_budget, command_budget)
+                .await
         }
 
-        async fn reconnect(&mut self, _page_size: u32) -> BichonResult<()> {
+        async fn reconnect(&mut self, page_size: u32) -> BichonResult<()> {
             self.reconnects += 1;
+            if self
+                .message_limit_after_reconnect
+                .take()
+                .is_some_and(|message_limit| message_limit < page_size)
+            {
+                return Err(raise_error!(
+                    "synthetic reconnect reduced MESSAGELIMIT".into(),
+                    ErrorCode::Incompatible
+                ));
+            }
             if let Some(snapshot) = self.snapshot_after_reconnect.take() {
                 self.inner.snapshot = snapshot;
             }
@@ -1460,6 +1678,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_batches_are_exact_and_progress_follows_projection_commits() {
+        let count = 40_u32;
+        let mut transport = FakeTransport {
+            snapshot: MailboxSnapshot {
+                exists: count,
+                uid_validity: 77,
+                uid_next: count + 1,
+            },
+            pages: VecDeque::from([(1..=count)
+                .map(|uid| inventory_item(uid, 1))
+                .collect::<Vec<_>>()]),
+            messages: (1..=count).map(|uid| (uid, vec![b'x'])).collect(),
+            fetched: Vec::new(),
+            fetch_batches: Vec::new(),
+            expected_cursor: None,
+        };
+        let mut bounded = limits();
+        bounded.page_size = count;
+        bounded.fetch_batch_size = 30;
+        let mut progress = Vec::new();
+        let report = run_acquisition(
+            &mut transport,
+            &mut FakeArchive::default(),
+            "synthetic",
+            Some(77),
+            bounded,
+            CancellationToken::new(),
+            |state| {
+                progress.push(state);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.archived, u64::from(count));
+        assert_eq!(transport.fetch_batches[0], (1..=30).collect::<Vec<_>>());
+        assert_eq!(transport.fetch_batches[1], (31..=40).collect::<Vec<_>>());
+        assert!(progress.iter().any(|state| state.downloaded == 32));
+        assert_eq!(progress.last().unwrap().downloaded, u64::from(count));
+    }
+
+    #[tokio::test]
     async fn reconnect_retries_the_same_inventory_cursor() {
         let mut transport = FlakyTransport::sparse();
         transport.inventory_failures = 1;
@@ -1523,11 +1784,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_overflow_reconnects_and_splits_without_skipping() {
+        let mut transport = FlakyTransport::sparse();
+        transport.aggregate_overflow_once = true;
+        let mut archive = FakeArchive::default();
+        let mut bounded = limits();
+        bounded.fetch_batch_size = 2;
+        let report = run_acquisition(
+            &mut transport,
+            &mut archive,
+            "synthetic",
+            Some(77),
+            bounded,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.archived, 3);
+        assert_eq!(transport.reconnects, 1);
+        assert_eq!(archive.projected, [2, 30, 50]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_reduced_messagelimit_without_advancing() {
+        let mut transport = FlakyTransport::sparse();
+        transport.inventory_failures = 1;
+        transport.message_limit_after_reconnect = Some(1);
+        let mut archive = FakeArchive::default();
+
+        let error = run_test(&mut transport, &mut archive).await.unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::Incompatible);
+        assert_eq!(transport.reconnects, 1);
+        assert!(transport.inner.fetched.is_empty());
+        assert!(archive.projected.is_empty());
+    }
+
+    #[tokio::test]
     async fn proven_checkpoint_scans_only_new_uids() {
         let mut transport = FakeTransport::sparse();
         transport.snapshot.exists = 4;
         transport.snapshot.uid_next = 60;
-        transport.pages = VecDeque::from([vec![InventoryItem { uid: 55 }]]);
+        transport.pages = VecDeque::from([vec![inventory_item(55, 64)]]);
         transport
             .messages
             .insert(55, b"Subject: new\r\n\r\nbody".to_vec());
@@ -1642,14 +1942,15 @@ mod tests {
             assert_eq!(cursor, self.cursor);
             let end = high.min(cursor + page_size - 1);
             self.cursor = end + 1;
-            Ok((cursor..=end).map(|uid| InventoryItem { uid }).collect())
+            Ok((cursor..=end).map(|uid| inventory_item(uid, 64)).collect())
         }
 
-        async fn fetch_exact(
+        async fn fetch_many(
             &mut self,
-            _uid: u32,
+            _items: &[InventoryItem],
             _literal_budget: u64,
-        ) -> BichonResult<UidOnlyMessage> {
+            _command_budget: u64,
+        ) -> BichonResult<Vec<UidOnlyMessage>> {
             unreachable!("every logical receipt verifies")
         }
     }
@@ -1711,9 +2012,29 @@ mod tests {
         response
     }
 
-    async fn connect_fake_transport(server: &MockImapServerHandle) -> SessionUidOnlyTransport {
+    fn exact_batch_response(entries: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        let mut response = Vec::new();
+        for (uid, reported_size, raw) in entries {
+            response.extend_from_slice(
+                format!(
+                    "* {uid} UIDFETCH (UID {uid} RFC822.SIZE {reported_size} BODY[] {{{}}}\r\n",
+                    raw.len()
+                )
+                .as_bytes(),
+            );
+            response.extend_from_slice(raw);
+            response.extend_from_slice(b")\r\n");
+        }
+        response.extend_from_slice(b"{TAG} OK exact fetch completed\r\n");
+        response
+    }
+
+    async fn connect_fake_transport_with_message_limit(
+        server: &MockImapServerHandle,
+        expected_message_limit: u32,
+    ) -> SessionUidOnlyTransport {
         let account = AccountModel {
-            email: "synthetic-user".into(),
+            email: "synthetic-user@example.invalid".into(),
             imap: Some(ImapConfig {
                 host: server.host(),
                 port: server.port(),
@@ -1740,13 +2061,13 @@ mod tests {
             .with_uidonly(limits.clone())
             .expect("install UIDONLY guard");
         let mut session = client
-            .login("synthetic-user", "synthetic-secret")
+            .login("synthetic-user@example.invalid", "synthetic-secret")
             .await
             .expect("synthetic login");
         let capabilities = session.capabilities().await.expect("capabilities");
         assert!(capabilities.has_str("UIDONLY"));
         assert!(capabilities.has_str("PARTIAL"));
-        assert!(capabilities.has_str("MESSAGELIMIT=2"));
+        assert!(capabilities.has_str(&format!("MESSAGELIMIT={expected_message_limit}")));
         session
             .run_command_and_check_ok("ENABLE UIDONLY")
             .await
@@ -1759,6 +2080,10 @@ mod tests {
             account,
             limits,
         }
+    }
+
+    async fn connect_fake_transport(server: &MockImapServerHandle) -> SessionUidOnlyTransport {
+        connect_fake_transport_with_message_limit(server, 2).await
     }
 
     #[tokio::test]
@@ -1784,19 +2109,26 @@ mod tests {
             .respond("UID FETCH 8:9", inventory_response(&[(9, 0)]))
             // The reported sizes are deliberately advisory and wrong. The
             // literal byte count is the acquisition/accounting authority.
-            .respond("UID FETCH 2 (", exact_response(2, 1, messages[0].1))
-            .respond("UID FETCH 7 (", exact_response(7, 2, messages[1].1))
+            .respond(
+                "UID FETCH 2,7 (",
+                exact_batch_response(&[
+                    (7, 2, messages[1].1),
+                    (2, 1, messages[0].1),
+                ]),
+            )
             .respond("UID FETCH 9 (", exact_response(9, 3, messages[2].1))
             .start()
         .await;
         let mut transport = connect_fake_transport(&server).await;
         let mut archive = FakeArchive::default();
+        let mut bounded = limits();
+        bounded.fetch_batch_size = 2;
         let report = run_acquisition(
             &mut transport,
             &mut archive,
             "Synthetic",
             Some(77),
-            limits(),
+            bounded,
             CancellationToken::new(),
             |_| Ok(()),
         )
@@ -1812,12 +2144,140 @@ mod tests {
         assert_eq!(commands.matches(" EXAMINE ").count(), 2);
         assert!(commands.contains(" UID FETCH 1:9 (UID RFC822.SIZE) (PARTIAL 1:2)"));
         assert!(commands.contains(" UID FETCH 8:9 (UID RFC822.SIZE) (PARTIAL 1:2)"));
-        assert_eq!(commands.matches("BODY.PEEK[]").count(), 3);
+        assert_eq!(commands.matches("BODY.PEEK[]").count(), 2);
         let commands = commands.to_ascii_uppercase();
         assert!(
             ![" STORE ", " MOVE ", " COPY ", " DELETE ", " EXPUNGE", " CLOSE",]
                 .iter()
                 .any(|forbidden| commands.contains(forbidden))
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_fake_yahoo_inventory_crosses_10000_before_one_30_body_command() {
+        const MESSAGE_COUNT: u32 = 10_030;
+        const PAGE_SIZE: u32 = 1_000;
+        const FIRST_BODY_UID: u32 = 10_001;
+
+        let mut server = MockImapServer::new()
+            .greeting("* OK synthetic Yahoo-like IMAP ready\r\n")
+            .respond("LOGIN", "{TAG} OK LOGIN completed\r\n")
+            .respond(
+                "CAPABILITY",
+                "* CAPABILITY IMAP4rev1 ENABLE UIDONLY PARTIAL MESSAGELIMIT=30\r\n{TAG} OK CAPABILITY completed\r\n",
+            )
+            .respond(
+                "ENABLE UIDONLY",
+                "* ENABLED UIDONLY\r\n{TAG} OK ENABLE completed\r\n",
+            )
+            .respond(
+                "EXAMINE",
+                examine_response("Synthetic", MESSAGE_COUNT, 77, MESSAGE_COUNT + 1),
+            );
+
+        let mut cursor = 1_u32;
+        while cursor <= MESSAGE_COUNT {
+            let end = MESSAGE_COUNT.min(cursor + PAGE_SIZE - 1);
+            let entries = (cursor..=end).map(|uid| (uid, 1_u32)).collect::<Vec<_>>();
+            server = server.respond(
+                format!("UID FETCH {cursor}:{MESSAGE_COUNT} ("),
+                inventory_response(&entries),
+            );
+            cursor = end + 1;
+        }
+
+        let requested_uids = (FIRST_BODY_UID..=MESSAGE_COUNT).collect::<Vec<_>>();
+        let body_command = format!(
+            "UID FETCH {} (",
+            requested_uids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let bodies = requested_uids
+            .iter()
+            .rev()
+            .map(|uid| (*uid, 1_u32, b"x".as_slice()))
+            .collect::<Vec<_>>();
+        let server = server
+            .respond(&body_command, exact_batch_response(&bodies))
+            .start()
+            .await;
+
+        let mut transport = connect_fake_transport_with_message_limit(&server, 30).await;
+        let mut archive = FakeArchive {
+            verified: (1..FIRST_BODY_UID).collect(),
+            ..Default::default()
+        };
+        let mut bounded = limits();
+        bounded.page_size = PAGE_SIZE;
+        bounded.fetch_batch_size = 30;
+        let report = run_acquisition(
+            &mut transport,
+            &mut archive,
+            "Synthetic",
+            Some(77),
+            bounded,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect("inventory and body retrieval must cross the 10,000-message boundary");
+
+        assert_eq!(report.inventoried, u64::from(MESSAGE_COUNT));
+        assert_eq!(report.archived, u64::from(MESSAGE_COUNT));
+        assert_eq!(report.checkpoint, Some(MESSAGE_COUNT));
+        assert_eq!(archive.projected, requested_uids);
+
+        let commands = server.commands().join("\n");
+        assert_eq!(
+            commands.matches("RFC822.SIZE) (PARTIAL 1:1000)").count(),
+            11
+        );
+        assert_eq!(commands.matches("BODY.PEEK[]").count(), 1);
+        assert!(commands.contains(&body_command));
+        let commands = commands.to_ascii_uppercase();
+        assert!(
+            ![" STORE ", " MOVE ", " COPY ", " DELETE ", " EXPUNGE", " CLOSE",]
+                .iter()
+                .any(|forbidden| commands.contains(forbidden))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_body_batch_rejects_missing_duplicate_and_extraneous_uids() {
+        let one = b"x".as_slice();
+        for response in [
+            exact_batch_response(&[(7, 1, one)]),
+            exact_batch_response(&[(7, 1, one), (7, 1, one)]),
+            exact_batch_response(&[(7, 1, one), (99, 1, one)]),
+        ] {
+            let server = MockImapServer::new()
+                .greeting("* OK synthetic IMAP ready\r\n")
+                .respond("LOGIN", "{TAG} OK LOGIN completed\r\n")
+                .respond(
+                    "CAPABILITY",
+                    "* CAPABILITY IMAP4rev1 ENABLE UIDONLY PARTIAL MESSAGELIMIT=2\r\n{TAG} OK CAPABILITY completed\r\n",
+                )
+                .respond(
+                    "ENABLE UIDONLY",
+                    "* ENABLED UIDONLY\r\n{TAG} OK ENABLE completed\r\n",
+                )
+                .respond("UID FETCH 7,42 (", response)
+                .start()
+                .await;
+            let mut transport = connect_fake_transport(&server).await;
+            let error = transport
+                .fetch_many(
+                    &[inventory_item(7, 1), inventory_item(42, 1)],
+                    64 * 1024,
+                    64 * 1024,
+                )
+                .await
+                .err()
+                .expect("malformed batch must fail");
+            assert_eq!(error.code(), ErrorCode::ImapUnexpectedResult);
+        }
     }
 }

@@ -799,12 +799,43 @@ pub(crate) fn inventory_args(
     ))
 }
 
-/// Injection-safe arguments for one complete, literal-backed raw message.
-pub(crate) fn exact_args(uid: u32) -> io::Result<(String, &'static str)> {
-    if uid == 0 {
-        return Err(invalid("UID 0 is invalid"));
+/// Injection-safe arguments for one bounded batch of complete raw messages.
+///
+/// The caller supplies an already bounded, strictly increasing UID list. A
+/// comma-only sequence set keeps exact-body commands distinguishable from the
+/// range-plus-PARTIAL inventory command admitted below.
+pub(crate) fn exact_args(uids: &[u32]) -> io::Result<(String, &'static str)> {
+    if uids.is_empty()
+        || uids.iter().any(|uid| *uid == 0)
+        || uids.windows(2).any(|window| window[0] >= window[1])
+    {
+        return Err(invalid(
+            "exact UIDONLY UIDs must be nonzero, unique, and increasing",
+        ));
     }
-    Ok((uid.to_string(), "(UID RFC822.SIZE BODY.PEEK[])"))
+    Ok((
+        uids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        "(UID RFC822.SIZE BODY.PEEK[])",
+    ))
+}
+
+fn exact_uid_set(set: &[u8]) -> bool {
+    let mut previous = 0_u32;
+    let mut count = 0_usize;
+    for value in set.split(|byte| *byte == b',') {
+        let Some(uid) = parse_nonzero_u32(value) else {
+            return false;
+        };
+        if uid <= previous {
+            return false;
+        }
+        previous = uid;
+        count += 1;
+    }
+    count > 0
 }
 
 fn uid_fetch_command_kind(command: &[u8]) -> Option<CommandKind> {
@@ -831,7 +862,7 @@ fn uid_fetch_command_kind(command: &[u8]) -> Option<CommandKind> {
             .and_then(parse_nonzero_u32)
             .map(|_| CommandKind::Inventory)
     } else {
-        (parse_nonzero_u32(set).is_some() && query == b"(UID RFC822.SIZE BODY.PEEK[])")
+        (exact_uid_set(set) && query == b"(UID RFC822.SIZE BODY.PEEK[])")
             .then_some(CommandKind::ExactFetch)
     }
 }

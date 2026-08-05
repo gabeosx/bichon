@@ -172,7 +172,7 @@ async fn public_async_imap_session_parses_fragmented_uidfetch_without_touching_l
     assert_eq!(mailbox.uid_validity, Some(7));
     assert_eq!(mailbox.uid_next, Some(50));
 
-    let (set, query) = exact_args(42).expect("safe UID");
+    let (set, query) = exact_args(&[42]).expect("safe UID");
     handle
         .arm_next_fetch_literal_limit(body.len())
         .expect("arm body bound");
@@ -237,6 +237,23 @@ async fn body_must_be_full_and_literal_backed() {
 }
 
 #[tokio::test]
+async fn disconnect_mid_literal_fails_closed_without_accepting_partial_body() {
+    let response = b"* 7 UIDFETCH (UID 7 RFC822.SIZE 4 BODY[] {4}\r\nab";
+    let (mut session, handle) = enabled(response, UidOnlyLimits::default(), 1).await;
+    handle
+        .arm_next_fetch_literal_limit(4)
+        .expect("arm body bound");
+
+    let stream = session
+        .uid_fetch("7", "(UID RFC822.SIZE BODY.PEEK[])")
+        .await
+        .expect("command");
+
+    assert!(stream.try_collect::<Vec<_>>().await.is_err());
+    assert!(handle.poison_reason().is_some());
+}
+
+#[tokio::test]
 async fn uidfetch_shape_accepts_requested_fields_in_either_order() {
     let response = b"* 42 UIDFETCH (RFC822.SIZE 1 UID 42)\r\nA0003 OK inventory\r\n\
                      * 42 UIDFETCH (RFC822.SIZE 1 UID 42 BODY[] {1}\r\nx)\r\nA0004 OK exact\r\n";
@@ -268,6 +285,30 @@ async fn uidfetch_shape_accepts_requested_fields_in_either_order() {
     assert_eq!(exact[0].uid, Some(42));
     assert_eq!(exact[0].size, Some(1));
     assert_eq!(exact[0].body(), Some(b"x".as_slice()));
+}
+
+#[tokio::test]
+async fn exact_multi_uid_command_accepts_out_of_order_responses_and_accounts_all_literals() {
+    let response = b"* 42 UIDFETCH (UID 42 RFC822.SIZE 1 BODY[] {1}\r\ny)\r\n\
+                     * 7 UIDFETCH (UID 7 RFC822.SIZE 1 BODY[] {1}\r\nx)\r\n\
+                     A0003 OK exact\r\n";
+    let (mut session, handle) = enabled(response, UidOnlyLimits::default(), 1).await;
+    let (set, query) = exact_args(&[7, 42]).expect("safe exact set");
+    handle
+        .arm_next_fetch_literal_limit(2)
+        .expect("arm aggregate body bound");
+    let fetched: Vec<_> = session
+        .uid_fetch(set, query)
+        .await
+        .expect("exact batch command")
+        .try_collect()
+        .await
+        .expect("exact batch response");
+
+    assert_eq!(fetched.len(), 2);
+    assert_eq!(fetched[0].uid, Some(42));
+    assert_eq!(fetched[1].uid, Some(7));
+    assert_eq!(handle.literal_bytes_received(), 2);
 }
 
 #[tokio::test]
@@ -513,5 +554,9 @@ fn numeric_query_builders_reject_invalid_bounds() {
     assert!(inventory_args(0, 20, 100).is_err());
     assert!(inventory_args(20, 10, 100).is_err());
     assert!(inventory_args(10, 20, 0).is_err());
-    assert!(exact_args(0).is_err());
+    assert_eq!(exact_args(&[2, 7, 42]).expect("safe UID batch").0, "2,7,42");
+    assert!(exact_args(&[]).is_err());
+    assert!(exact_args(&[0]).is_err());
+    assert!(exact_args(&[2, 2]).is_err());
+    assert!(exact_args(&[7, 2]).is_err());
 }
